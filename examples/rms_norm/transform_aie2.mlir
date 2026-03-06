@@ -86,17 +86,19 @@ module attributes {transform.with_named_sequence} {
     %at_buf, %at_new = transform.structured.bufferize_to_allocation %at
         {memory_space = 1, emit_dealloc} : !transform.any_op
 
-    // Promote sq generic output to L2 via promote_tensor (avoids hanging from bufferize_to_allocation)
-    %sq_gens = transform.structured.match ops{["linalg.generic"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-    %sq_gen_only, %rest_gens = transform.split_handle %sq_gens {overflow_result = 1}
+    // Promote all tensor results outside forall to memory_space 1.
+    // This tells one_shot_bufferize to use L2 for these allocs.
+    %sq_gens_p = transform.structured.match ops{["linalg.generic"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %sq_gen_p, %rest_p = transform.split_handle %sq_gens_p {overflow_result = 1}
         : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-    %sq_result = transform.get_result %sq_gen_only[0]
+    %sq_res = transform.get_result %sq_gen_p[0]
         : (!transform.any_op) -> !transform.any_value
-    transform.structured.promote_tensor to 1 %sq_result : !transform.any_value
+    transform.structured.promote_tensor to 1 %sq_res : !transform.any_value
 
-    // Note: fills and reduces get memory_space 1 from the pre-pass
-    // air-override-memref-memory-space{scope=func memory-space=1}.
-    // No explicit promotion needed.
+    %reduce_p = transform.structured.match ops{["linalg.reduce"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    %reduce_res = transform.get_result %reduce_p[0]
+        : (!transform.any_op) -> !transform.any_value
+    transform.structured.promote_tensor to 1 %reduce_res : !transform.any_value
 
     // Phase 6: Bufferize
     %func_op = transform.structured.match ops{["func.func"]} in %arg1 : (!transform.any_op) -> !transform.any_op
