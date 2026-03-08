@@ -278,18 +278,10 @@ def _ttshared_to_air(mod, gridX, gridY, gridZ):
         transform_ir_string = _get_transform_ir_string()
         transform_ir = Module.parse(transform_ir_string, context=air_context)
         run_transform(transform_ir, air_module)
-        # MLIR-AIR compilation step 2.5: fix memory spaces after transform.
-        # one_shot_bufferize creates memref.alloc at default memory_space 0.
-        # Override: herd allocs→2 (L1), func allocs→1 (L2).
-        # With exclusive scopes (mlir-air >= a2a7316), scope=func skips herds.
-        pm_ms = air.passmanager.PassManager.parse(
-            "builtin.module("
-            "air-override-memref-memory-space{scope=herd memory-space=2},"
-            "air-override-memref-memory-space{scope=func memory-space=1}"
-            ")",
-            context=air_context,
-        )
-        pm_ms.run(air_module.operation)
+        # MLIR-AIR compilation step 2.5: NOT NEEDED when the transform
+        # pre-allocates all tensor ops to correct memory spaces via
+        # bufferize_to_allocation. The pre-pass (step 1) handles existing
+        # memrefs, and the relu pattern handles forall-internal allocs.
         # Step 2.6: REMOVED -- type fix moved to step 3.5 (after air-par-to-launch).
         # MLIR-AIR compilation step 3: converting to AIR
         pipeline = (
