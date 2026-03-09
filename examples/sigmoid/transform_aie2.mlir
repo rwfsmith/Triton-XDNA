@@ -138,6 +138,9 @@ module attributes {transform.with_named_sequence} {
     %parallel = transform.loop.forall_to_parallel %forall_as_herd : (!transform.any_op) -> !transform.any_op
     %herd = transform.air.par_to_herd %parallel : (!transform.any_op) -> !transform.any_op
 
+    %extern_func_param = transform.param.constant "extern_func.o" -> !transform.any_param
+    transform.annotate %herd "link_with" = %extern_func_param : !transform.any_op, !transform.any_param
+
     %copies_in_herd = transform.structured.match ops{["memref.copy", "linalg.copy"]} in %herd : (!transform.any_op) -> !transform.any_op
     %dmas_from_copies = transform.air.copy_to_dma %copies_in_herd : (!transform.any_op) -> !transform.any_op
 
