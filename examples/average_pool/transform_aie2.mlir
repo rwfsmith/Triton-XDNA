@@ -1,7 +1,7 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: MIT
 
-// Mean subtraction transform for AIE2P.
+// Mean subtraction transform for AIE2.
 // y = x - mean(x, dim=-1)
 //
 // 2D kernel (BLOCK_M=2 x BLOCK_N=256) with 2D output [BLOCK_M, BLOCK_N].
@@ -101,7 +101,7 @@ module attributes {transform.with_named_sequence} {
     } : !transform.any_op
     transform.apply_cse to %func_final : !transform.any_op
 
-    // AIE2P type casts: mulf/addf/subf bf16-only, divf f32-only
+    // AIE2 type casts: mulf/addf/subf bf16-only, divf f32-only
     %vh2 = transform.structured.match ops{["air.herd"]} in %arg1 : (!transform.any_op) -> !transform.any_op
     %vector_adds = transform.structured.match ops{["arith.addf"]} in %vh2 : (!transform.any_op) -> !transform.any_op
     %add_cast = transform.air.vector_type_cast %vector_adds {target_element_type = bf16} : (!transform.any_op) -> !transform.any_op
