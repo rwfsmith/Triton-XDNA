@@ -1,0 +1,67 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: MIT
+
+name: Generate Examples Dashboard
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'examples/**/transform_*.mlir'
+      - 'examples/generate_readme.py'
+      - 'examples/*/*.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build dashboard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Generate dashboard
+        run: |
+          mkdir -p _site
+          python3 examples/generate_readme.py \
+            --output _site/index.md \
+            --base-url https://github.com/amd/Triton-XDNA/tree/main/examples/ \
+            --verify
+
+      - name: Add Jekyll config
+        run: |
+          cat > _site/_config.yml << 'EOF'
+          title: Triton-XDNA Examples
+          theme: jekyll-theme-cayman
+          EOF
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
