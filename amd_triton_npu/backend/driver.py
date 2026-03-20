@@ -732,7 +732,11 @@ def compile_module(launcher_src, kernel_placeholder_name):
                 xclbin_path = os.path.join(air_proj_path, "aie.xclbin")
                 insts_path = os.path.join(air_proj_path, "insts.bin")
                 air_mlir_path = os.path.join(air_proj_path, "asm_air_output.mlir")
-                aircc_bin = str(Path(aircc.__file__).resolve().parent.parent.parent.parent.parent / "bin" / "aircc")
+                aircc_bin = str(
+                    Path(aircc.__file__).resolve().parent.parent.parent.parent.parent
+                    / "bin"
+                    / "aircc"
+                )
                 aircc_cmd = [
                     aircc_bin,
                     "--device",
