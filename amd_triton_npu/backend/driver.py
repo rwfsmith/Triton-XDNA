@@ -1293,8 +1293,8 @@ def compile_module(
                 # multiply, with f32 accumulation.
                 if os.getenv("AMD_TRITON_NPU_BF16_EMULATION", "0") == "1":
                     aircc_cmd.insert(-1, "--bf16-emulation")
-                # Explicitly set runtime loop tiling sizes (aircc default
-                # changed from [4,4] to [] in mlir-air #1470).
+                # Explicitly set runtime loop tiling sizes to [4,4] (aircc
+                # default changed from [4,4] to [] in mlir-air #1470).
                 aircc_cmd.insert(-1, "--air-runtime-loop-tiling-sizes=4")
                 aircc_cmd.insert(-1, "--air-runtime-loop-tiling-sizes=4")
                 subprocess.check_call(aircc_cmd)

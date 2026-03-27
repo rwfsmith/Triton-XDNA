@@ -27,8 +27,8 @@ transform.named_sequence @vectorize_generics_at_32(
 
 // Post-vectorization cleanup for reduction kernels (softmax, layernorm,
 // rms_norm): convert size-1 vectors to scalars (downstream compiler
-// cannot handle them), then lower multi_reduction and cast away
-// leading-one vector dims.
+// cannot handle them), cast away leading-one vector dims, then lower
+// multi_reduction ops.
 transform.named_sequence @post_vectorize_reduce_cleanup(
     %module: !transform.any_op {transform.readonly}) {
   %func = transform.structured.match ops{["func.func"]} in %module
@@ -40,12 +40,9 @@ transform.named_sequence @post_vectorize_reduce_cleanup(
       transform.apply_patterns.scf.for_loop_canonicalization
       transform.apply_patterns.canonicalization
       transform.apply_patterns.vector.cast_away_vector_leading_one_dim
-      transform.apply_patterns.vector.reorder_multi_reduction_dims
-          lowering_strategy = "innerreduction"
-      transform.apply_patterns.vector.multi_reduction_flattening
-          lowering_strategy = "innerreduction"
-      transform.apply_patterns.vector.multi_reduction_unrolling
-          lowering_strategy = "innerreduction"
+      transform.apply_patterns.vector.reorder_multi_reduction_dims lowering_strategy = "innerreduction"
+      transform.apply_patterns.vector.multi_reduction_flattening lowering_strategy = "innerreduction"
+      transform.apply_patterns.vector.multi_reduction_unrolling lowering_strategy = "innerreduction"
   } : !transform.any_op
   transform.apply_cse to %func_done : !transform.any_op
   transform.yield
