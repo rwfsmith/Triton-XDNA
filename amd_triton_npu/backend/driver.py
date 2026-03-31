@@ -110,6 +110,21 @@ def _get_air_opt_path() -> str:
     air_opt_path = mlir_air_root / "bin" / binary_name
 
     if not air_opt_path.exists():
+        # Fallback: check MLIR_AIR_INSTALL_DIR env var
+        mlir_air_env = os.environ.get("MLIR_AIR_INSTALL_DIR")
+        if mlir_air_env:
+            air_opt_path = Path(mlir_air_env) / "bin" / binary_name
+        if not air_opt_path.exists():
+            # Fallback: check common Windows build location
+            for candidate in [
+                Path("C:/projects/mlir-air/install/bin") / binary_name,
+                Path(os.path.dirname(aircc_path)).parent.parent.parent / "bin" / binary_name,
+            ]:
+                if candidate.exists():
+                    air_opt_path = candidate
+                    break
+
+    if not air_opt_path.exists():
         raise RuntimeError(f"Could not find air-opt binary at {air_opt_path}")
 
     return str(air_opt_path)
@@ -608,15 +623,16 @@ def _generate_launch_cpp(signature, constants, arg_decls, autotune_time):
     last_ptr_idx = ptr_args[-1][0] if ptr_args else 0
     input_ptr_args = ptr_args[:-1]  # all except output (last)
 
-    # Static BO declarations (one per pointer arg) + cached map pointers
+    # Static BO declarations (one per pointer arg) + cached map pointers + last-ptr tracking
     bo_statics = "\n".join(
         f"static xrt::bo* _p_bo_{i} = nullptr; static long _cached_size_{i} = 0; "
-        f"static void* _p_map_{i} = nullptr;"
+        f"static void* _p_map_{i} = nullptr; static void* _last_src_{i} = nullptr;"
         for i, _ in ptr_args
     )
     # Cleanup code (delete all cached BOs)
     bo_cleanup = " ".join(
-        f"delete _p_bo_{i}; _p_bo_{i} = nullptr; _cached_size_{i} = 0; _p_map_{i} = nullptr;"
+        f"delete _p_bo_{i}; _p_bo_{i} = nullptr; _cached_size_{i} = 0; "
+        f"_p_map_{i} = nullptr; _last_src_{i} = nullptr;"
         for i, _ in ptr_args
     )
     # BO reallocation checks (only when size changes) — also update cached map ptr
@@ -625,15 +641,32 @@ def _generate_launch_cpp(signature, constants, arg_decls, autotune_time):
         f"{{ delete _p_bo_{i}; "
         f"_p_bo_{i} = new xrt::bo(device, size{i}, XRT_BO_FLAGS_HOST_ONLY, kernel.group_id({i+3})); "
         f"_cached_size_{i} = size{i}; _p_map_{i} = _p_bo_{i}->map<void*>(); "
+        f"_last_src_{i} = nullptr; "
         f"_run_args_dirty = true; }}"
         for i, _ in ptr_args
     )
     # Data copy-in: only INPUT buffers (not output) get synced to device
-    data_copy_in = "\n    ".join(
-        f"memcpy(_p_map_{i}, arg{i}, size{i}); "
-        f"_p_bo_{i}->sync(XCL_BO_SYNC_BO_TO_DEVICE);"
-        for i, _ in input_ptr_args
-    )
+    # OPTIMIZATION: weight-resident — skip copy if same data pointer.
+    # IMPORTANT: Only applied to NON-FIRST input args (weights), because the
+    # first arg (activations) may get the same pointer from PyTorch's memory
+    # allocator even though the data changed (allocator reuses freed addresses).
+    data_copy_in_parts = []
+    for idx, (i, _) in enumerate(input_ptr_args):
+        if idx == 0:
+            # Always copy first input (activation) — pointer may be recycled
+            data_copy_in_parts.append(
+                f"memcpy(_p_map_{i}, arg{i}, size{i}); "
+                f"_p_bo_{i}->sync(XCL_BO_SYNC_BO_TO_DEVICE);"
+            )
+        else:
+            # Weight-resident: skip if same pointer (persistent weight tensor)
+            data_copy_in_parts.append(
+                f"if (arg{i} != _last_src_{i}) {{ "
+                f"memcpy(_p_map_{i}, arg{i}, size{i}); "
+                f"_p_bo_{i}->sync(XCL_BO_SYNC_BO_TO_DEVICE); "
+                f"_last_src_{i} = arg{i}; }}"
+            )
+    data_copy_in = "\n    ".join(data_copy_in_parts)
     # Kernel call arguments
     bo_args = ", ".join(f"*_p_bo_{i}" for i, _ in ptr_args)
     # Size parameters for function signature
@@ -716,7 +749,7 @@ def _generate_launch_cpp(signature, constants, arg_decls, autotune_time):
     code.append("    // --- Reload instructions only if path changed ---")
     code.append("    if (_p_bo_instr == nullptr || strcmp(_cached_insts_path, insts_path) != 0) {")
     code.append("        delete _p_bo_instr; _p_bo_instr = nullptr;")
-    code.append("        std::vector<uint32_t> instr_v = test_utils::load_instr_binary(insts_path);")
+    code.append("        std::vector<uint32_t> instr_v = _load_instr_binary(std::string(insts_path));")
     code.append("        _cached_instr_count = instr_v.size();")
     code.append("        _p_bo_instr = new xrt::bo(device, instr_v.size() * sizeof(int),")
     code.append("                                  XCL_BO_FLAGS_CACHEABLE, kernel.group_id(1));")
@@ -822,7 +855,15 @@ def _generate_launcher(constants, signature, kernel_name):
 #include "ExecutionEngine/CRunnerUtils.h"
 #include "ExecutionEngine/CRunnerUtils.cpp"
 
-#include "test_utils.h"
+// Inline load_instr_binary (replaces test_utils.h dependency)
+static std::vector<uint32_t> _load_instr_binary(const std::string& path) {{
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f.is_open()) {{ throw std::runtime_error("Cannot open " + path); }}
+    auto sz = f.tellg(); f.seekg(0);
+    std::vector<uint32_t> v(sz / sizeof(uint32_t));
+    f.read(reinterpret_cast<char*>(v.data()), sz);
+    return v;
+}}
 
 #include <chrono>
 #include <cstdlib>
@@ -1499,6 +1540,15 @@ def compile_module(
                     / "bin"
                     / aircc_binary_name
                 )
+                # Fallback: check common locations if air module was copied
+                if not os.path.isfile(aircc_bin):
+                    for candidate in [
+                        str(Path("C:/projects/mlir-air/install/bin") / aircc_binary_name),
+                        os.path.join(os.environ.get("MLIR_AIR_INSTALL_DIR", ""), "bin", aircc_binary_name),
+                    ]:
+                        if os.path.isfile(candidate):
+                            aircc_bin = candidate
+                            break
 
                 # On Windows, construct peano path from llvm-aie package and
                 # add mlir_aie/bin to PATH so aircc can find aiecc.exe
