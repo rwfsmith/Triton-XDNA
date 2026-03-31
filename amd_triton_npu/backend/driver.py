@@ -616,6 +616,9 @@ def _generate_launch_cpp(signature, constants, arg_decls, autotune_time):
     - Skip sync-to-device for output buffer (last pointer arg) — NPU writes it
     - Cache xrt::run object and reuse with start()/wait() instead of kernel()
     - Cache BO map<void*> pointers to avoid repeated virtual address lookups
+    - Per-slot weight BOs: each "slot" (e.g., layer×projection) gets its own
+      weight BO so different weights can stay resident simultaneously.
+      Use mod.set_slot(id) before mod.launch() to select the weight slot.
     - Optional per-section profiling via AMD_TRITON_NPU_PROFILE_DISPATCH env var
     """
     ptr_args = [(i, ty) for i, ty in signature.items()
@@ -623,33 +626,75 @@ def _generate_launch_cpp(signature, constants, arg_decls, autotune_time):
     last_ptr_idx = ptr_args[-1][0] if ptr_args else 0
     input_ptr_args = ptr_args[:-1]  # all except output (last)
 
-    # Static BO declarations (one per pointer arg) + cached map pointers + last-ptr tracking
-    bo_statics = "\n".join(
-        f"static xrt::bo* _p_bo_{i} = nullptr; static long _cached_size_{i} = 0; "
-        f"static void* _p_map_{i} = nullptr; static void* _last_src_{i} = nullptr;"
-        for i, _ in ptr_args
-    )
-    # Cleanup code (delete all cached BOs)
-    bo_cleanup = " ".join(
-        f"delete _p_bo_{i}; _p_bo_{i} = nullptr; _cached_size_{i} = 0; "
-        f"_p_map_{i} = nullptr; _last_src_{i} = nullptr;"
-        for i, _ in ptr_args
-    )
-    # BO reallocation checks (only when size changes) — also update cached map ptr
-    bo_realloc = "\n    ".join(
-        f"if (_cached_size_{i} != size{i}) "
-        f"{{ delete _p_bo_{i}; "
-        f"_p_bo_{i} = new xrt::bo(device, size{i}, XRT_BO_FLAGS_HOST_ONLY, kernel.group_id({i+3})); "
-        f"_cached_size_{i} = size{i}; _p_map_{i} = _p_bo_{i}->map<void*>(); "
-        f"_last_src_{i} = nullptr; "
-        f"_run_args_dirty = true; }}"
-        for i, _ in ptr_args
-    )
-    # Data copy-in: only INPUT buffers (not output) get synced to device
-    # OPTIMIZATION: weight-resident — skip copy if same data pointer.
-    # IMPORTANT: Only applied to NON-FIRST input args (weights), because the
-    # first arg (activations) may get the same pointer from PyTorch's memory
-    # allocator even though the data changed (allocator reuses freed addresses).
+    # Classify args: weight args are non-first input args (idx > 0 in input_ptr_args)
+    weight_arg_set = set()
+    for idx, (i, _) in enumerate(input_ptr_args):
+        if idx > 0:
+            weight_arg_set.add(i)
+
+    # Static BO declarations — per-slot arrays for weight args, single for others
+    bo_statics_parts = []
+    for i, _ in ptr_args:
+        if i in weight_arg_set:
+            bo_statics_parts.append(
+                f"static xrt::bo* _p_bo_{i}_slots[MAX_WEIGHT_SLOTS] = {{}};\n"
+                f"static void* _p_map_{i}_slots[MAX_WEIGHT_SLOTS] = {{}};\n"
+                f"static void* _last_src_{i}_slots[MAX_WEIGHT_SLOTS] = {{}};\n"
+                f"static long _cached_size_{i} = 0;"
+            )
+        else:
+            bo_statics_parts.append(
+                f"static xrt::bo* _p_bo_{i} = nullptr; static long _cached_size_{i} = 0; "
+                f"static void* _p_map_{i} = nullptr; static void* _last_src_{i} = nullptr;"
+            )
+    bo_statics = "\n".join(bo_statics_parts)
+
+    # Cleanup code
+    bo_cleanup_parts = []
+    for i, _ in ptr_args:
+        if i in weight_arg_set:
+            bo_cleanup_parts.append(
+                f"for(int _s=0;_s<MAX_WEIGHT_SLOTS;_s++){{"
+                f"delete _p_bo_{i}_slots[_s];_p_bo_{i}_slots[_s]=nullptr;"
+                f"_p_map_{i}_slots[_s]=nullptr;_last_src_{i}_slots[_s]=nullptr;}} "
+                f"_cached_size_{i}=0;"
+            )
+        else:
+            bo_cleanup_parts.append(
+                f"delete _p_bo_{i}; _p_bo_{i} = nullptr; _cached_size_{i} = 0; "
+                f"_p_map_{i} = nullptr; _last_src_{i} = nullptr;"
+            )
+    bo_cleanup = " ".join(bo_cleanup_parts)
+
+    # BO reallocation — only for shared (non-weight) args
+    bo_realloc_parts = []
+    for i, _ in ptr_args:
+        if i not in weight_arg_set:
+            bo_realloc_parts.append(
+                f"if (_cached_size_{i} != size{i}) "
+                f"{{ delete _p_bo_{i}; "
+                f"_p_bo_{i} = new xrt::bo(device, size{i}, XRT_BO_FLAGS_HOST_ONLY, kernel.group_id({i+3})); "
+                f"_cached_size_{i} = size{i}; _p_map_{i} = _p_bo_{i}->map<void*>(); "
+                f"_last_src_{i} = nullptr; "
+                f"_run_args_dirty = true; }}"
+            )
+    bo_realloc = "\n    ".join(bo_realloc_parts) if bo_realloc_parts else ""
+
+    # Weight slot BO lazy allocation
+    weight_slot_alloc_parts = []
+    for i, _ in ptr_args:
+        if i in weight_arg_set:
+            weight_slot_alloc_parts.append(
+                f"if (_p_bo_{i}_slots[_slot] == nullptr) {{\n"
+                f"        _p_bo_{i}_slots[_slot] = new xrt::bo(device, size{i}, XRT_BO_FLAGS_HOST_ONLY, kernel.group_id({i+3}));\n"
+                f"        _p_map_{i}_slots[_slot] = _p_bo_{i}_slots[_slot]->map<void*>();\n"
+                f"        _last_src_{i}_slots[_slot] = nullptr;\n"
+                f"        _cached_size_{i} = size{i};\n"
+                f"    }}"
+            )
+    weight_slot_alloc = "\n    ".join(weight_slot_alloc_parts) if weight_slot_alloc_parts else ""
+
+    # Data copy-in
     data_copy_in_parts = []
     for idx, (i, _) in enumerate(input_ptr_args):
         if idx == 0:
@@ -658,24 +703,31 @@ def _generate_launch_cpp(signature, constants, arg_decls, autotune_time):
                 f"memcpy(_p_map_{i}, arg{i}, size{i}); "
                 f"_p_bo_{i}->sync(XCL_BO_SYNC_BO_TO_DEVICE);"
             )
-        else:
-            # Weight-resident: skip if same pointer (persistent weight tensor)
+        elif i in weight_arg_set:
+            # Per-slot weight-resident: skip copy if same source pointer for this slot
             data_copy_in_parts.append(
-                f"if (arg{i} != _last_src_{i}) {{ "
-                f"memcpy(_p_map_{i}, arg{i}, size{i}); "
-                f"_p_bo_{i}->sync(XCL_BO_SYNC_BO_TO_DEVICE); "
-                f"_last_src_{i} = arg{i}; }}"
+                f"if (arg{i} != _last_src_{i}_slots[_slot]) {{ "
+                f"memcpy(_p_map_{i}_slots[_slot], arg{i}, size{i}); "
+                f"_p_bo_{i}_slots[_slot]->sync(XCL_BO_SYNC_BO_TO_DEVICE); "
+                f"_last_src_{i}_slots[_slot] = arg{i}; }}"
             )
     data_copy_in = "\n    ".join(data_copy_in_parts)
+
     # Kernel call arguments
     bo_args = ", ".join(f"*_p_bo_{i}" for i, _ in ptr_args)
     # Size parameters for function signature
     size_params = ", ".join(f"long size{i}" for i, _ in ptr_args)
 
-    # set_arg lines for cached run (indices: 0=opcode, 1=instr_bo, 2=instr_count, 3+=data BOs)
-    set_run_args = "\n        ".join(
+    # set_arg lines for cached run — SHARED args only (weight args set separately per slot)
+    set_run_shared_args = "\n        ".join(
         f"_p_run->set_arg({idx+3}, *_p_bo_{i});"
         for idx, (i, _) in enumerate(ptr_args)
+        if i not in weight_arg_set
+    )
+    # set_arg lines for weight slot BOs — always set (slot changes per dispatch)
+    set_run_weight_args = "\n    ".join(
+        f"_p_run->set_arg({list(dict(ptr_args).keys()).index(i)+3}, *_p_bo_{i}_slots[_slot]);"
+        for i in weight_arg_set
     )
 
     # Optional timing code
@@ -760,10 +812,15 @@ def _generate_launch_cpp(signature, constants, arg_decls, autotune_time):
     code.append("        _run_args_dirty = true;")
     code.append("    }")
     code.append("")
-    code.append("    // --- Reallocate data BOs only when sizes change ---")
+    code.append("    // --- Reallocate shared BOs (activation, output) only when sizes change ---")
     code.append(f"    {bo_realloc}")
     code.append("")
-    code.append("    // --- Create/update xrt::run if args changed ---")
+    code.append("    // --- Get current weight slot and lazy-allocate slot BOs ---")
+    code.append("    int _slot = _current_slot;")
+    if weight_slot_alloc:
+        code.append(f"    {weight_slot_alloc}")
+    code.append("")
+    code.append("    // --- Create/update xrt::run if shared args changed ---")
     code.append("    if (_p_run == nullptr) {")
     code.append("        _p_run = new xrt::run(kernel);")
     code.append("        _run_args_dirty = true;")
@@ -774,9 +831,12 @@ def _generate_launch_cpp(signature, constants, arg_decls, autotune_time):
     code.append("        _p_run->set_arg(1, *_p_bo_instr);")
     code.append("        unsigned int ic = (unsigned int)_cached_instr_count;")
     code.append("        _p_run->set_arg(2, ic);")
-    code.append(f"        {set_run_args}")
+    code.append(f"        {set_run_shared_args}")
     code.append("        _run_args_dirty = false;")
     code.append("    }")
+    if set_run_weight_args:
+        code.append("    // --- Always set weight BO args (slot changes per dispatch) ---")
+        code.append(f"    {set_run_weight_args}")
     code.append("")
     code.append("    _t1 = std::chrono::high_resolution_clock::now();")
     code.append("")
@@ -798,8 +858,9 @@ def _generate_launch_cpp(signature, constants, arg_decls, autotune_time):
     code.append("    _t3 = std::chrono::high_resolution_clock::now();")
     code.append("")
     code.append("    // --- Copy output back (last tensor only) ---")
-    code.append(f"    _p_bo_{last_ptr_idx}->sync(XCL_BO_SYNC_BO_FROM_DEVICE);")
-    code.append(f"    memcpy(arg{last_ptr_idx}, _p_map_{last_ptr_idx}, size{last_ptr_idx});")
+    code.append(f"    long _out_bytes = (_output_bytes > 0 && _output_bytes < size{last_ptr_idx}) ? _output_bytes : size{last_ptr_idx};")
+    code.append(f"    _p_bo_{last_ptr_idx}->sync(XCL_BO_SYNC_BO_FROM_DEVICE, _out_bytes, 0);")
+    code.append(f"    memcpy(arg{last_ptr_idx}, _p_map_{last_ptr_idx}, _out_bytes);")
     code.append("")
     code.append("    _t4 = std::chrono::high_resolution_clock::now();")
     code.append("")
@@ -876,6 +937,10 @@ static std::vector<uint32_t> _load_instr_binary(const std::string& path) {{
 
 static char aie_path[1024] = {{0}};
 static char insts_path[1024] = {{0}};
+#ifndef MAX_WEIGHT_SLOTS
+#define MAX_WEIGHT_SLOTS 256
+#endif
+static int _current_slot = 0;
 
 static PyObject* py_set_paths(PyObject* self, PyObject* args) {{
     const char* aie;
@@ -890,6 +955,29 @@ static PyObject* py_set_paths(PyObject* self, PyObject* args) {{
     aie_path[sizeof(aie_path) - 1] = '\\0';
     insts_path[sizeof(insts_path) - 1] = '\\0';
 
+    Py_RETURN_NONE;
+}}
+
+static PyObject* py_set_slot(PyObject* self, PyObject* args) {{
+    int slot;
+    if (!PyArg_ParseTuple(args, "i", &slot)) {{
+        return NULL;
+    }}
+    if (slot < 0 || slot >= MAX_WEIGHT_SLOTS) {{
+        PyErr_Format(PyExc_ValueError, "slot %d out of range [0, %d)", slot, MAX_WEIGHT_SLOTS);
+        return NULL;
+    }}
+    _current_slot = slot;
+    Py_RETURN_NONE;
+}}
+
+static long _output_bytes = 0;
+static PyObject* py_set_output_bytes(PyObject* self, PyObject* args) {{
+    long nbytes;
+    if (!PyArg_ParseTuple(args, "l", &nbytes)) {{
+        return NULL;
+    }}
+    _output_bytes = nbytes;
     Py_RETURN_NONE;
 }}
 
@@ -1051,6 +1139,8 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
 static PyMethodDef ModuleMethods[] = {{
   {{"launch", launch, METH_VARARGS, "Entry point for all kernels with this signature"}},
   {{"set_paths", py_set_paths, METH_VARARGS, "Set paths to aie.bin and insts.bin"}},
+  {{"set_slot", py_set_slot, METH_VARARGS, "Set weight BO slot for per-layer weight residency"}},
+  {{"set_output_bytes", py_set_output_bytes, METH_VARARGS, "Set partial output copy size (0=full)"}},
   {{NULL, NULL, 0, NULL}} // sentinel
 }};
 

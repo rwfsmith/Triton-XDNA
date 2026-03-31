@@ -144,6 +144,8 @@ class NPUInt8Engine:
         self._compile_count = 0
         self._x_bufs = {}    # K -> pre-allocated [M_BLOCK, K] int8 pad buffer
         self._c_bufs = {}    # N -> pre-allocated [M_BLOCK, N] int32 output buffer
+        self._slot_counters = {}     # shape_key -> next available slot ID
+        self._c_bufs = {}    # N -> pre-allocated [M_BLOCK, N] int32 output buffer
 
     def _set_i8_transform(self):
         os.environ["AIR_TRANSFORM_TILING_SCRIPT"] = os.path.join(
@@ -219,6 +221,12 @@ class NPUInt8Engine:
         self._swiglu_bs = block_size
         print(" OK")
 
+    def _next_slot(self, shape_key):
+        """Get next available weight slot ID for a given shape."""
+        slot = self._slot_counters.get(shape_key, 0)
+        self._slot_counters[shape_key] = slot + 1
+        return slot
+
     def prepare_layer(self, name, linear, max_K=4096):
         """Quantize weights to INT8 and register for NPU dispatch."""
         K_full = linear.in_features
@@ -235,11 +243,13 @@ class NPUInt8Engine:
 
             weight_tiles_i8 = []
             scale_tiles = []
+            tile_slots = []
             for i in range(n_tiles):
                 w_slice = weight_t[i * K_tile : (i + 1) * K_tile, :]
                 w_i8, s_w = quantize_weight_per_channel(w_slice)
                 weight_tiles_i8.append(w_i8.contiguous())
                 scale_tiles.append(s_w)
+                tile_slots.append(self._next_slot((M, N, K_tile)))
 
             self._compile_i8_shape(M, N, K_tile)
             self._layers[name] = {
@@ -250,10 +260,12 @@ class NPUInt8Engine:
                 "K_full": K_full,
                 "K_tile": K_tile,
                 "N": N,
+                "slots": tile_slots,
             }
         else:
             w_i8, s_w = quantize_weight_per_channel(weight_t)
             self._compile_i8_shape(M, N, K_full)
+            slot = self._next_slot((M, N, K_full))
             self._layers[name] = {
                 "weight_tiles": [w_i8.contiguous()],
                 "scale_w_tiles": [s_w],
@@ -262,6 +274,7 @@ class NPUInt8Engine:
                 "K_full": K_full,
                 "K_tile": K_full,
                 "N": N,
+                "slots": [slot],
             }
 
     def matmul(self, name, x):
@@ -297,6 +310,8 @@ class NPUInt8Engine:
                 weight_i8 = info["weight_tiles"][t]
                 scale_w = info["scale_w_tiles"][t]
 
+                mod.set_slot(info["slots"][t])
+                mod.set_output_bytes(M_actual * N_actual * 4)
                 mod.launch(
                     gX, gY, 1, None, None, None, None,
                     buf, weight_i8, c,
@@ -348,6 +363,8 @@ class NPUInt8Engine:
         scale_w = info["scale_w_tiles"][0]
         c = self._c_bufs[N]
 
+        mod.set_slot(info["slots"][0])
+        mod.set_output_bytes(M_actual * N * 4)
         mod.launch(
             gX, gY, 1, None, None, None, None,
             x_i8, weight_i8, c,
@@ -412,6 +429,8 @@ def patch_model_int8(model, engine):
     compression = total_orig_bytes / total_quant_bytes
     print(f"  Total weight memory: {total_orig_bytes/1e6:.0f} MB → {total_quant_bytes/1e6:.0f} MB ({compression:.1f}x)")
     print(f"  Compiled {engine._compile_count} unique INT8 NPU kernels")
+    total_slots = sum(engine._slot_counters.values())
+    print(f"  Weight residency: {total_slots} slots across {len(engine._slot_counters)} shapes")
 
     # Patch MLP
     def make_mlp_forward(layer_idx):
