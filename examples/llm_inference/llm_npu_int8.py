@@ -433,7 +433,7 @@ def patch_model_int8(model, engine, verbose=True):
 
     compression = total_orig_bytes / total_quant_bytes
     if verbose:
-        print(f"  Total weight memory: {total_orig_bytes/1e6:.0f} MB → {total_quant_bytes/1e6:.0f} MB ({compression:.1f}x)")
+        print(f"  Total weight memory: {total_orig_bytes/1e6:.0f} MB -> {total_quant_bytes/1e6:.0f} MB ({compression:.1f}x)")
         print(f"  Compiled {engine._compile_count} unique INT8 NPU kernels")
         total_slots = sum(engine._slot_counters.values())
         print(f"  Weight residency: {total_slots} slots across {len(engine._slot_counters)} shapes")
