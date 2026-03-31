@@ -115,14 +115,10 @@ def _get_air_opt_path() -> str:
         if mlir_air_env:
             air_opt_path = Path(mlir_air_env) / "bin" / binary_name
         if not air_opt_path.exists():
-            # Fallback: check common Windows build location
-            for candidate in [
-                Path("C:/projects/mlir-air/install/bin") / binary_name,
-                Path(os.path.dirname(aircc_path)).parent.parent.parent / "bin" / binary_name,
-            ]:
-                if candidate.exists():
-                    air_opt_path = candidate
-                    break
+            # Fallback: try relative path from aircc module
+            candidate = Path(os.path.dirname(aircc_path)).parent.parent.parent / "bin" / binary_name
+            if candidate.exists():
+                air_opt_path = candidate
 
     if not air_opt_path.exists():
         raise RuntimeError(f"Could not find air-opt binary at {air_opt_path}")
@@ -1633,15 +1629,13 @@ def compile_module(
                     / "bin"
                     / aircc_binary_name
                 )
-                # Fallback: check common locations if air module was copied
+                # Fallback: check MLIR_AIR_INSTALL_DIR if air module was copied
                 if not os.path.isfile(aircc_bin):
-                    for candidate in [
-                        str(Path("C:/projects/mlir-air/install/bin") / aircc_binary_name),
-                        os.path.join(os.environ.get("MLIR_AIR_INSTALL_DIR", ""), "bin", aircc_binary_name),
-                    ]:
+                    mlir_air_env = os.environ.get("MLIR_AIR_INSTALL_DIR", "")
+                    if mlir_air_env:
+                        candidate = os.path.join(mlir_air_env, "bin", aircc_binary_name)
                         if os.path.isfile(candidate):
                             aircc_bin = candidate
-                            break
 
                 # On Windows, construct peano path from llvm-aie package and
                 # add mlir_aie/bin to PATH so aircc can find aiecc.exe
