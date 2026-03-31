@@ -153,11 +153,14 @@ pip install -e . --no-build-isolation -v
 
 The MLIR-AIE pipeline needs `xclbinutil` to package device binaries. Options:
 
-1. **Build from XRT source** (recommended): Clone [Xilinx/XRT](https://github.com/Xilinx/XRT),
+1. **Download from XRT Windows SDK** (easiest): Grab `xrt_windows_sdk.zip` from
+   [Xilinx/XRT releases](https://github.com/Xilinx/XRT/releases) and extract
+   `xclbinutil.exe` from the archive
+2. **Build from XRT source**: Clone [Xilinx/XRT](https://github.com/Xilinx/XRT),
    build just the `xclbinutil` target with CMake/MSVC
-2. **Use the included Python assembler** as a fallback: `utils/xclbin_assemble.py`
+3. **Use the included Python assembler** as a fallback: `utils/xclbin_assemble.py`
 
-Place the executable or make it available at:
+Place the executable on your PATH or in:
 ```
 <mlir_aie_install>/bin/xclbinutil.exe
 ```
