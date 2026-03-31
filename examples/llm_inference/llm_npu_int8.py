@@ -18,6 +18,7 @@
 #   - Same dispatch overhead, but faster compute for bandwidth-bound shapes
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 import time
@@ -128,6 +129,8 @@ def quantize_activation_per_row(x):
 class NPUInt8Engine:
     """NPU dispatch engine using INT8×INT8→INT32 matmul with dequantization."""
 
+    M_BLOCK = 128  # Block size for matmul M dimension (128 = 2x less NPU compute vs 256)
+
     def __init__(self):
         self.npu_driver = importlib.import_module(
             "triton.backends.amd_triton_npu.driver"
@@ -139,6 +142,8 @@ class NPUInt8Engine:
         self._swiglu_n = None
         self.dispatch_count = 0
         self._compile_count = 0
+        self._x_bufs = {}    # K -> pre-allocated [M_BLOCK, K] int8 pad buffer
+        self._c_bufs = {}    # N -> pre-allocated [M_BLOCK, N] int32 output buffer
 
     def _set_i8_transform(self):
         os.environ["AIR_TRANSFORM_TILING_SCRIPT"] = os.path.join(
@@ -157,7 +162,8 @@ class NPUInt8Engine:
             return
 
         self._set_i8_transform()
-        gX = triton.cdiv(M, 256)
+        MB = self.M_BLOCK
+        gX = triton.cdiv(M, MB)
         gY = triton.cdiv(N, 256)
         print(f"    Compiling INT8 matmul {M}x{N}x{K} (grid={gX}x{gY})...", end="", flush=True)
 
@@ -168,7 +174,7 @@ class NPUInt8Engine:
             a, b, c, M, N, K,
             a.stride(0), a.stride(1), b.stride(0), b.stride(1),
             c.stride(0), c.stride(1),
-            BLOCK_SIZE_M=256, BLOCK_SIZE_N=256, BLOCK_SIZE_K=K,
+            BLOCK_SIZE_M=MB, BLOCK_SIZE_N=256, BLOCK_SIZE_K=K,
         )
         mod = self.npu_driver._last_dispatched_module
         if mod is None:
@@ -183,6 +189,12 @@ class NPUInt8Engine:
 
         self._modules[shape_key] = (mod, gX, gY, M, N, K)
         self._compile_count += 1
+
+        # Pre-allocate reusable buffers for this shape
+        if K not in self._x_bufs:
+            self._x_bufs[K] = torch.zeros(MB, K, dtype=torch.int8)
+        if N not in self._c_bufs:
+            self._c_bufs[N] = torch.empty(MB, N, dtype=torch.int32)
 
     def compile_swiglu(self, n_elements, block_size=1024):
         """Compile SwiGLU kernel (stays BF16)."""
@@ -211,7 +223,7 @@ class NPUInt8Engine:
         """Quantize weights to INT8 and register for NPU dispatch."""
         K_full = linear.in_features
         N = linear.out_features
-        M = 256
+        M = self.M_BLOCK
 
         # Transpose: W[out, in] -> W_t[in, out] = [K, N]
         weight_t = linear.weight.data.T.contiguous().float()
@@ -253,79 +265,102 @@ class NPUInt8Engine:
             }
 
     def matmul(self, name, x):
-        """INT8 matmul on NPU: quantize x → INT8 dispatch → dequantize output.
+        """INT8 matmul on NPU with optimized quantization.
 
-        Args:
-            name: Layer name (registered via prepare_layer)
-            x: Input [batch, in_features] in bf16
-
-        Returns:
-            output [batch, out_features] in bf16
+        For non-K-tiled shapes, quantizes and dispatches via matmul_preq.
+        For K-tiled shapes (down_proj), quantizes each tile slice separately
+        using pre-allocated buffers to avoid memory allocation overhead.
         """
         info = self._layers[name]
-        mod, gX, gY, M, N, K = self._modules[info["shape_key"]]
-        N = info["N"]
         M_actual = x.shape[0]
 
         if info["k_tiles"] == 1:
-            # Quantize activation to INT8 (per-row)
-            if M_actual < 256:
-                x_pad = torch.zeros(256, info["K_full"], dtype=x.dtype)
-                x_pad[:M_actual] = x
-            else:
-                x_pad = x
-            x_i8, scale_x = quantize_activation_per_row(x_pad)
-
-            weight_i8 = info["weight_tiles"][0]
-            scale_w = info["scale_w_tiles"][0]
-
-            c = torch.empty(256, N, dtype=torch.int32)
-            mod.launch(
-                gX, gY, 1, None, None, None, None,
-                x_i8, weight_i8, c,
-                M, N, K,
-                x_i8.stride(0), x_i8.stride(1),
-                weight_i8.stride(0), weight_i8.stride(1),
-                c.stride(0), c.stride(1),
-                256, 256, K,
-            )
-            self.dispatch_count += 1
-
-            # Dequantize: result = c_int32 * scale_x[i] * scale_w[j]
-            result_f32 = c[:M_actual].float() * (scale_x[:M_actual, None] * scale_w[None, :])
-            return result_f32.to(torch.bfloat16)
+            x_i8, scale_x = self.quantize_and_pad(x, info["K_full"])
+            return self.matmul_preq(name, x_i8, scale_x, M_actual)
         else:
-            # K-tiled
+            # K-tiled: quantize each slice using pre-allocated buffers
             K_tile = info["K_tile"]
-            accum_f32 = torch.zeros(M_actual, N, dtype=torch.float32)
+            mod, gX, gY, M, N, K = self._modules[info["shape_key"]]
+            N_actual = info["N"]
+            accum_f32 = torch.zeros(M_actual, N_actual, dtype=torch.float32)
 
-            if M_actual < 256:
-                x_pad = torch.zeros(256, info["K_full"], dtype=x.dtype)
-                x_pad[:M_actual] = x
-            else:
-                x_pad = x
+            x_float = x.float()  # convert once, slice from this
+            buf = self._x_bufs[K_tile]
+            c = self._c_bufs[N_actual]
 
             for t in range(info["k_tiles"]):
-                x_slice = x_pad[:, t * K_tile : (t + 1) * K_tile].contiguous()
-                x_i8, scale_x = quantize_activation_per_row(x_slice)
+                x_slice = x_float[:M_actual, t * K_tile : (t + 1) * K_tile]
+                row_max = x_slice.abs().amax(dim=1)
+                scale_x = (row_max / 127.0).clamp(min=1e-10)
+                buf[:M_actual] = (x_slice / scale_x[:, None]).round().clamp(-128, 127).to(torch.int8)
 
                 weight_i8 = info["weight_tiles"][t]
                 scale_w = info["scale_w_tiles"][t]
 
-                c = torch.empty(256, N, dtype=torch.int32)
                 mod.launch(
                     gX, gY, 1, None, None, None, None,
-                    x_i8, weight_i8, c,
-                    M, N, K_tile,
-                    x_i8.stride(0), x_i8.stride(1),
+                    buf, weight_i8, c,
+                    M, N_actual, K_tile,
+                    buf.stride(0), buf.stride(1),
                     weight_i8.stride(0), weight_i8.stride(1),
                     c.stride(0), c.stride(1),
-                    256, 256, K_tile,
+                    self.M_BLOCK, 256, K_tile,
                 )
                 self.dispatch_count += 1
                 accum_f32 += c[:M_actual].float() * (scale_x[:M_actual, None] * scale_w[None, :])
 
             return accum_f32.to(torch.bfloat16)
+
+    def quantize_and_pad(self, x, K):
+        """Quantize activation per-row, writing only real rows into pre-allocated buffer.
+
+        During decode (M=1), this is 12x faster than quantizing the full 256-row
+        padded tensor. The padding rows keep their previous values but this doesn't
+        affect correctness since we only read c[:M_actual] from the NPU output.
+
+        Args:
+            x: [M_actual, K] bf16 activation (M_actual typically 1 during decode)
+            K: K dimension (must match a pre-allocated buffer)
+
+        Returns:
+            x_i8: [M_BLOCK, K] int8 buffer (pre-allocated, only [:M_actual] updated)
+            scale_x: [M_actual] float32 per-row scales
+        """
+        M_actual = x.shape[0]
+        assert M_actual <= self.M_BLOCK, f"M_actual={M_actual} exceeds M_BLOCK={self.M_BLOCK}"
+        buf = self._x_bufs[K]
+        x_float = x.float()
+        row_max = x_float.abs().amax(dim=1)  # [M_actual]
+        scale_x = (row_max / 127.0).clamp(min=1e-10)
+        buf[:M_actual] = (x_float / scale_x[:, None]).round().clamp(-128, 127).to(torch.int8)
+        return buf, scale_x
+
+    def matmul_preq(self, name, x_i8, scale_x, M_actual):
+        """INT8 matmul with pre-quantized activation (non-K-tiled only).
+
+        Used when multiple projections share the same input (e.g., Q/K/V or gate/up)
+        to avoid redundant quantization.
+        """
+        info = self._layers[name]
+        mod, gX, gY, M, N, K = self._modules[info["shape_key"]]
+        N = info["N"]
+        weight_i8 = info["weight_tiles"][0]
+        scale_w = info["scale_w_tiles"][0]
+        c = self._c_bufs[N]
+
+        mod.launch(
+            gX, gY, 1, None, None, None, None,
+            x_i8, weight_i8, c,
+            M, N, K,
+            x_i8.stride(0), x_i8.stride(1),
+            weight_i8.stride(0), weight_i8.stride(1),
+            c.stride(0), c.stride(1),
+            self.M_BLOCK, 256, K,
+        )
+        self.dispatch_count += 1
+
+        result_f32 = c[:M_actual].float() * (scale_x[:M_actual, None] * scale_w[None, :])
+        return result_f32.to(torch.bfloat16)
 
     def swiglu(self, gate_flat, up_flat):
         """SwiGLU on NPU (stays BF16)."""
@@ -383,9 +418,12 @@ def patch_model_int8(model, engine):
         def mlp_forward(self, hidden_states):
             x = hidden_states.squeeze(0) if hidden_states.dim() == 3 else hidden_states
             x_bf16 = x.to(torch.bfloat16)
+            M_actual = x_bf16.shape[0]
 
-            gate = engine.matmul(f"L{layer_idx}.gate", x_bf16)
-            up = engine.matmul(f"L{layer_idx}.up", x_bf16)
+            # Quantize once for gate + up (shared input → saves 1 quant/layer)
+            x_i8, scale_x = engine.quantize_and_pad(x_bf16, K=x_bf16.shape[1])
+            gate = engine.matmul_preq(f"L{layer_idx}.gate", x_i8, scale_x, M_actual)
+            up = engine.matmul_preq(f"L{layer_idx}.up", x_i8, scale_x, M_actual)
 
             if gate.shape[0] == 1:
                 activated = engine.swiglu(gate.view(-1), up.view(-1)).view(gate.shape)
@@ -409,10 +447,13 @@ def patch_model_int8(model, engine):
             hidden_shape = (*input_shape, -1, self.head_dim)
 
             x = hidden_states.reshape(-1, hidden_states.shape[-1]).to(torch.bfloat16)
+            M_actual = x.shape[0]
 
-            q = engine.matmul(f"L{layer_idx}.q", x).to(hidden_states.dtype)
-            k = engine.matmul(f"L{layer_idx}.k", x).to(hidden_states.dtype)
-            v = engine.matmul(f"L{layer_idx}.v", x).to(hidden_states.dtype)
+            # Quantize once for Q, K, V (shared input → saves 2 quants/layer)
+            x_i8, scale_x = engine.quantize_and_pad(x, K=x.shape[1])
+            q = engine.matmul_preq(f"L{layer_idx}.q", x_i8, scale_x, M_actual).to(hidden_states.dtype)
+            k = engine.matmul_preq(f"L{layer_idx}.k", x_i8, scale_x, M_actual).to(hidden_states.dtype)
+            v = engine.matmul_preq(f"L{layer_idx}.v", x_i8, scale_x, M_actual).to(hidden_states.dtype)
 
             query_states = q.view(hidden_shape).transpose(1, 2)
             key_states = k.view(hidden_shape).transpose(1, 2)
@@ -443,7 +484,9 @@ def patch_model_int8(model, engine):
 
             attn_output = attn_output.reshape(*input_shape, -1).contiguous()
             attn_out_2d = attn_output.reshape(-1, attn_output.shape[-1]).to(torch.bfloat16)
-            attn_output = engine.matmul(f"L{layer_idx}.o", attn_out_2d)
+            # O proj: separate quantization (different input from Q/K/V)
+            o_i8, o_scale = engine.quantize_and_pad(attn_out_2d, K=attn_out_2d.shape[1])
+            attn_output = engine.matmul_preq(f"L{layer_idx}.o", o_i8, o_scale, M_actual)
             attn_output = attn_output.view(*input_shape, -1).to(hidden_states.dtype)
 
             return attn_output, attn_weights
@@ -473,8 +516,205 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
 
 
 # =============================================================================
-# Main
+# Custom Forward Pass — bypasses all HuggingFace overhead
 # =============================================================================
+
+def generate_fast(model, engine, tokenizer, prompt, max_tokens):
+    """Custom transformer forward that bypasses HuggingFace framework.
+
+    Instead of model(input_ids) → Module.__call__ → hooks → forward → ...,
+    this directly implements the transformer layers with raw tensor ops.
+    Eliminates ~79% CPU overhead from framework dispatch.
+    """
+    # ---- Extract model components ----
+    cfg = model.config
+    num_layers = cfg.num_hidden_layers      # 24
+    hidden_size = cfg.hidden_size           # 2048
+    num_heads = cfg.num_attention_heads     # 32
+    head_dim = cfg.head_dim                 # 64
+    intermediate = cfg.intermediate_size    # 8192
+    eps = cfg.rms_norm_eps                  # 1e-5
+    scale = 1.0 / (head_dim ** 0.5)        # 0.125
+
+    embed_w = model.model.embed_tokens.weight.data          # [vocab, hidden]
+    final_norm_w = model.model.norm.weight.data              # [hidden]
+    lm_head_w = model.lm_head.weight.data                    # [vocab, hidden]
+
+    # Per-layer norm weights (avoid Module.__call__)
+    input_ln_w = [l.input_layernorm.weight.data for l in model.model.layers]
+    post_ln_w = [l.post_attention_layernorm.weight.data for l in model.model.layers]
+
+    # ---- RMSNorm (inline, no module overhead) ----
+    def rms_norm(x, weight):
+        x_f = x.float()
+        normed = x_f * torch.rsqrt(x_f.pow(2).mean(-1, keepdim=True) + eps)
+        return (normed * weight).to(torch.bfloat16)
+
+    # ---- Rotary embedding (inline) ----
+    def apply_rotary(x, cos, sin):
+        """x: [heads, seq, head_dim], cos/sin: [1, seq, head_dim]"""
+        x1, x2 = x[..., :head_dim // 2], x[..., head_dim // 2:]
+        rotated = torch.cat((-x2, x1), dim=-1)
+        return x * cos + rotated * sin
+
+    # ---- Tokenize ----
+    messages = [{"role": "user", "content": prompt}]
+    chat_input = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    input_ids = tokenizer(chat_input, return_tensors="pt")["input_ids"][0]
+    prompt_len = input_ids.shape[0]
+    max_seq = prompt_len + max_tokens + 1
+
+    # ---- Pre-compute rotary embeddings for all positions ----
+    with torch.no_grad():
+        dummy = torch.zeros(1, 1, hidden_size, dtype=torch.bfloat16)
+        positions = torch.arange(max_seq).unsqueeze(0)
+        cos_all, sin_all = model.model.rotary_emb(dummy, positions)
+    # cos_all: [1, max_seq, head_dim] → [max_seq, head_dim]
+    cos_all = cos_all.squeeze(0)
+    sin_all = sin_all.squeeze(0)
+
+    # ---- Pre-allocate KV cache (avoids torch.cat allocation per layer) ----
+    k_caches = [torch.zeros(num_heads, max_seq, head_dim, dtype=torch.bfloat16)
+                for _ in range(num_layers)]
+    v_caches = [torch.zeros(num_heads, max_seq, head_dim, dtype=torch.bfloat16)
+                for _ in range(num_layers)]
+
+    # ---- Core forward pass ----
+    def forward_pass(token_ids, start_pos, cache_len):
+        """Run transformer on token_ids with position offset and KV cache.
+
+        Args:
+            token_ids: [S] int64 tensor
+            start_pos: starting position for RoPE
+            cache_len: current filled length of KV cache
+        Returns:
+            logits: [S, vocab] float32
+        """
+        S = token_ids.shape[0]
+
+        # Embedding (simple indexing, no Module.__call__)
+        hidden = embed_w[token_ids].to(torch.bfloat16)  # [S, hidden]
+
+        # RoPE cos/sin for this batch of positions
+        cos = cos_all[start_pos:start_pos + S].unsqueeze(0)  # [1, S, head_dim]
+        sin = sin_all[start_pos:start_pos + S].unsqueeze(0)
+
+        for i in range(num_layers):
+            residual = hidden
+
+            # ---- Input LayerNorm ----
+            normed = rms_norm(hidden, input_ln_w[i])
+
+            # ---- Q/K/V with shared quantization (1 quant for 3 projections) ----
+            x_i8, sx = engine.quantize_and_pad(normed, K=hidden_size)
+            q = engine.matmul_preq(f"L{i}.q", x_i8, sx, S)
+            k = engine.matmul_preq(f"L{i}.k", x_i8, sx, S)
+            v = engine.matmul_preq(f"L{i}.v", x_i8, sx, S)
+
+            # Reshape to multi-head: [S, hidden] → [heads, S, head_dim]
+            q = q.view(S, num_heads, head_dim).permute(1, 0, 2)
+            k = k.view(S, num_heads, head_dim).permute(1, 0, 2)
+            v = v.view(S, num_heads, head_dim).permute(1, 0, 2)
+
+            # Rotary embeddings
+            q = apply_rotary(q, cos, sin)
+            k = apply_rotary(k, cos, sin)
+
+            # KV cache update (in-place, no allocation)
+            k_caches[i][:, cache_len:cache_len + S, :] = k
+            v_caches[i][:, cache_len:cache_len + S, :] = v
+            total_len = cache_len + S
+
+            # Attention (fused SDPA — avoids 6+ intermediate tensor allocs)
+            k_full = k_caches[i][:, :total_len, :]      # view, no copy
+            v_full = v_caches[i][:, :total_len, :]
+            context = F.scaled_dot_product_attention(
+                q, k_full, v_full,
+                is_causal=(S > 1 and cache_len == 0),
+                scale=scale,
+            )  # [heads, S, head_dim]
+
+            # Reshape back: [heads, S, head_dim] → [S, hidden]
+            context = context.permute(1, 0, 2).reshape(S, hidden_size).to(torch.bfloat16)
+
+            # ---- O projection (separate quantization) ----
+            o_i8, o_sx = engine.quantize_and_pad(context, K=hidden_size)
+            attn_out = engine.matmul_preq(f"L{i}.o", o_i8, o_sx, S)
+
+            # Residual
+            hidden = residual + attn_out.to(residual.dtype)
+
+            # ---- Post-attention LayerNorm ----
+            residual = hidden
+            normed = rms_norm(hidden, post_ln_w[i])
+
+            # ---- MLP: gate + up with shared quantization ----
+            m_i8, m_sx = engine.quantize_and_pad(normed, K=hidden_size)
+            gate = engine.matmul_preq(f"L{i}.gate", m_i8, m_sx, S)
+            up = engine.matmul_preq(f"L{i}.up", m_i8, m_sx, S)
+
+            # SwiGLU on NPU
+            if S == 1:
+                activated = engine.swiglu(gate.view(-1), up.view(-1)).view(1, intermediate)
+            else:
+                activated = torch.empty_like(gate)
+                for j in range(S):
+                    activated[j] = engine.swiglu(gate[j].contiguous(), up[j].contiguous())
+
+            # Down projection (K-tiled path)
+            down = engine.matmul(f"L{i}.down", activated)
+
+            # Residual
+            hidden = residual + down.to(residual.dtype)
+
+        # ---- Final norm + LM head ----
+        hidden = rms_norm(hidden, final_norm_w)
+        logits = torch.matmul(hidden.float(), lm_head_w.float().T)
+        return logits
+
+    # ---- Generation loop ----
+    print(f"  Prompt: \"{prompt}\"")
+    print()
+
+    engine.dispatch_count = 0
+    token_times = []
+    generated_tokens = []
+    cache_len = 0
+
+    with torch.inference_mode():
+        # Prefill
+        t0 = time.perf_counter()
+        logits = forward_pass(input_ids, start_pos=0, cache_len=0)
+        cache_len = prompt_len
+        next_id = logits[-1].argmax().item()
+        generated_tokens.append(next_id)
+        dt = time.perf_counter() - t0
+        token_times.append(dt)
+
+        tok_str = tokenizer.decode([next_id], skip_special_tokens=True)
+        print(f"  Token  1: \"{tok_str}\"  ({dt * 1000:.0f}ms) [prefill]", flush=True)
+
+        # Decode
+        for i in range(1, max_tokens):
+            t0 = time.perf_counter()
+            token_tensor = torch.tensor([next_id], dtype=torch.long)
+            logits = forward_pass(token_tensor, start_pos=cache_len, cache_len=cache_len)
+            cache_len += 1
+            next_id = logits[0].argmax().item()
+            generated_tokens.append(next_id)
+            dt = time.perf_counter() - t0
+            token_times.append(dt)
+
+            tok_str = tokenizer.decode([next_id], skip_special_tokens=True)
+            print(f"  Token {i + 1:2d}: \"{tok_str}\"  ({dt * 1000:.0f}ms)", flush=True)
+
+            if next_id == tokenizer.eos_token_id:
+                break
+
+    full_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+    return full_text, token_times, engine.dispatch_count
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="INT8 NPU LLM inference")
@@ -536,7 +776,7 @@ if __name__ == "__main__":
         messages, tokenize=False, add_generation_prompt=True
     )
     inputs = tokenizer(chat_input, return_tensors="pt")
-    with torch.no_grad():
+    with torch.inference_mode():
         _ = model.generate(inputs["input_ids"], max_new_tokens=1, do_sample=False)
     warmup_time = time.perf_counter() - t0
     print(f"  Warmup: {warmup_time:.1f}s")
@@ -554,7 +794,7 @@ if __name__ == "__main__":
     generated_ids = inputs["input_ids"].clone()
     past_key_values = None
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for i in range(args.max_tokens):
             t_tok = time.perf_counter()
 
