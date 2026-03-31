@@ -9,17 +9,77 @@ Usage:
     python chat.py --model HuggingFaceTB/SmolLM2-1.7B-Instruct
 """
 
-import torch
-import triton
-import triton.language as tl
-import time
 import os
 import sys
+import time
 import types
 import importlib
 import argparse
 import io
 import contextlib
+
+# Must be set before importing triton so it discovers the NPU backend
+os.environ.setdefault("TRITON_BACKENDS_IN_TREE", "1")
+os.environ.setdefault("AMD_TRITON_NPU_OUTPUT_FORMAT", "xclbin")
+# XRT headers / libs for compilation
+if "XRT_DEV_DIR" not in os.environ:
+    _xrt_candidates = [r"C:\projects\xrt-dev", r"C:\xrt-dev"]
+    for _p in _xrt_candidates:
+        if os.path.isdir(_p):
+            os.environ["XRT_DEV_DIR"] = _p
+            break
+
+
+def _ensure_msvc_env():
+    """Auto-detect MSVC and Windows SDK paths if cl.exe is not on PATH."""
+    import shutil
+    if shutil.which("cl"):
+        return  # already available
+    # Find VS 2022 MSVC
+    vs_base = r"C:\Program Files\Microsoft Visual Studio\2022"
+    for edition in ("Community", "Professional", "Enterprise", "BuildTools"):
+        tools_dir = os.path.join(vs_base, edition, "VC", "Tools", "MSVC")
+        if os.path.isdir(tools_dir):
+            versions = sorted(os.listdir(tools_dir), reverse=True)
+            if versions:
+                msvc = os.path.join(tools_dir, versions[0])
+                cl_dir = os.path.join(msvc, "bin", "Hostx64", "x64")
+                if os.path.isfile(os.path.join(cl_dir, "cl.exe")):
+                    os.environ["PATH"] = cl_dir + ";" + os.environ.get("PATH", "")
+                    os.environ.setdefault("INCLUDE",
+                        os.path.join(msvc, "include"))
+                    os.environ.setdefault("LIB",
+                        os.path.join(msvc, "lib", "x64"))
+                    break
+    # Find Windows SDK
+    sdk_base = r"C:\Program Files (x86)\Windows Kits\10"
+    sdk_inc = os.path.join(sdk_base, "Include")
+    sdk_lib = os.path.join(sdk_base, "Lib")
+    if os.path.isdir(sdk_inc):
+        versions = sorted(os.listdir(sdk_inc), reverse=True)
+        if versions:
+            v = versions[0]
+            sdk_incs = ";".join(os.path.join(sdk_inc, v, d) for d in ("ucrt", "um", "shared"))
+            sdk_libs = ";".join(os.path.join(sdk_lib, v, d, "x64") for d in ("ucrt", "um"))
+            os.environ["INCLUDE"] = os.environ.get("INCLUDE", "") + ";" + sdk_incs
+            os.environ["LIB"] = os.environ.get("LIB", "") + ";" + sdk_libs
+    # DIA SDK (needed by some tools)
+    for edition in ("Community", "Professional", "Enterprise", "BuildTools"):
+        dia = os.path.join(vs_base, edition, "DIA SDK")
+        if os.path.isdir(dia):
+            try:
+                import subprocess
+                subprocess.run(["subst", "Z:", dia], capture_output=True)
+            except Exception:
+                pass
+            break
+
+
+_ensure_msvc_env()
+
+import torch
+import triton
+import triton.language as tl
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.join(SCRIPT_DIR, ".."))
@@ -57,7 +117,6 @@ def main():
     print("  Loading model...", end="", flush=True)
 
     # ── Init NPU backend (suppress noise) ──
-    os.environ["TRITON_BACKENDS_IN_TREE"] = "1"
     with suppress_stderr():
         import benchmark
         benchmark.select_npu_backend()
