@@ -62,27 +62,30 @@ def main():
         import benchmark
         benchmark.select_npu_backend()
 
-    engine = mod.NPUInt8Engine()
+    engine = mod.NPUInt8Engine(verbose=False)
 
     # ── Load model ──
     from transformers import AutoModelForCausalLM, AutoTokenizer
     import warnings
     warnings.filterwarnings("ignore")
+    os.environ["TQDM_DISABLE"] = "1"  # suppress loading progress bar
 
     t0 = time.perf_counter()
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, torch_dtype=torch.bfloat16,
+        args.model, dtype=torch.bfloat16,
     )
     model.eval()
     load_time = time.perf_counter() - t0
+    del os.environ["TQDM_DISABLE"]
     print(f" done ({load_time:.1f}s)")
 
     # ── Quantize & compile ──
     print("  Compiling NPU kernels...", end="", flush=True)
     t0 = time.perf_counter()
-    with suppress_stderr(), contextlib.redirect_stdout(io.StringIO()):
-        mod.patch_model_int8(model, engine)
+    with suppress_stderr(), open(os.devnull, 'w') as _devnull, \
+         contextlib.redirect_stdout(_devnull):
+        mod.patch_model_int8(model, engine, verbose=False)
     compile_time = time.perf_counter() - t0
     print(f" done ({compile_time:.1f}s)")
 

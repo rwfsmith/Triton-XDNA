@@ -131,7 +131,7 @@ class NPUInt8Engine:
 
     M_BLOCK = 128  # Block size for matmul M dimension (128 = 2x less NPU compute vs 256)
 
-    def __init__(self):
+    def __init__(self, verbose=True):
         self.npu_driver = importlib.import_module(
             "triton.backends.amd_triton_npu.driver"
         )
@@ -145,7 +145,7 @@ class NPUInt8Engine:
         self._x_bufs = {}    # K -> pre-allocated [M_BLOCK, K] int8 pad buffer
         self._c_bufs = {}    # N -> pre-allocated [M_BLOCK, N] int32 output buffer
         self._slot_counters = {}     # shape_key -> next available slot ID
-        self._c_bufs = {}    # N -> pre-allocated [M_BLOCK, N] int32 output buffer
+        self.verbose = verbose
 
     def _set_i8_transform(self):
         os.environ["AIR_TRANSFORM_TILING_SCRIPT"] = os.path.join(
@@ -167,7 +167,8 @@ class NPUInt8Engine:
         MB = self.M_BLOCK
         gX = triton.cdiv(M, MB)
         gY = triton.cdiv(N, 256)
-        print(f"    Compiling INT8 matmul {M}x{N}x{K} (grid={gX}x{gY})...", end="", flush=True)
+        if self.verbose:
+            print(f"    Compiling INT8 matmul {M}x{N}x{K} (grid={gX}x{gY})...", end="", flush=True)
 
         a = torch.randint(-128, 127, (M, K), dtype=torch.int8)
         b = torch.randint(-128, 127, (K, N), dtype=torch.int8)
@@ -187,7 +188,8 @@ class NPUInt8Engine:
         match = torch.equal(c, c_ref)
         status = "PASS" if match else "FAIL"
         max_diff = (c - c_ref).abs().max().item()
-        print(f" {status} (diff={max_diff})")
+        if self.verbose:
+            print(f" {status} (diff={max_diff})")
 
         self._modules[shape_key] = (mod, gX, gY, M, N, K)
         self._compile_count += 1
@@ -203,7 +205,8 @@ class NPUInt8Engine:
         if self._swiglu_mod is not None:
             return
         self._set_swiglu_transform()
-        print(f"    Compiling SwiGLU N={n_elements}...", end="", flush=True)
+        if self.verbose:
+            print(f"    Compiling SwiGLU N={n_elements}...", end="", flush=True)
 
         gate = torch.randn(n_elements, dtype=torch.bfloat16)
         up = torch.randn(n_elements, dtype=torch.bfloat16)
@@ -219,7 +222,8 @@ class NPUInt8Engine:
         self._swiglu_n = n_elements
         self._swiglu_grid = grid[0]
         self._swiglu_bs = block_size
-        print(" OK")
+        if self.verbose:
+            print(" OK")
 
     def _next_slot(self, shape_key):
         """Get next available weight slot ID for a given shape."""
@@ -396,13 +400,14 @@ class NPUInt8Engine:
 # Model Patching
 # =============================================================================
 
-def patch_model_int8(model, engine):
+def patch_model_int8(model, engine, verbose=True):
     """Replace all Linear projections with INT8 NPU dispatch."""
     num_layers = model.config.num_hidden_layers
     hidden = model.config.hidden_size
     intermediate = model.config.intermediate_size
 
-    print(f"  Quantizing & registering {num_layers} layers for INT8 NPU dispatch...")
+    if verbose:
+        print(f"  Quantizing & registering {num_layers} layers for INT8 NPU dispatch...")
 
     # Quantize all weights and register
     total_orig_bytes = 0
@@ -427,10 +432,11 @@ def patch_model_int8(model, engine):
     engine.compile_swiglu(intermediate)
 
     compression = total_orig_bytes / total_quant_bytes
-    print(f"  Total weight memory: {total_orig_bytes/1e6:.0f} MB → {total_quant_bytes/1e6:.0f} MB ({compression:.1f}x)")
-    print(f"  Compiled {engine._compile_count} unique INT8 NPU kernels")
-    total_slots = sum(engine._slot_counters.values())
-    print(f"  Weight residency: {total_slots} slots across {len(engine._slot_counters)} shapes")
+    if verbose:
+        print(f"  Total weight memory: {total_orig_bytes/1e6:.0f} MB → {total_quant_bytes/1e6:.0f} MB ({compression:.1f}x)")
+        print(f"  Compiled {engine._compile_count} unique INT8 NPU kernels")
+        total_slots = sum(engine._slot_counters.values())
+        print(f"  Weight residency: {total_slots} slots across {len(engine._slot_counters)} shapes")
 
     # Patch MLP
     def make_mlp_forward(layer_idx):
