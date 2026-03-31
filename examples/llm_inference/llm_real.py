@@ -163,18 +163,43 @@ def npu_elementwise_mul(x_flat, w_flat):
 npu_dispatch_count = 0
 
 
+def fuse_gate_up_weights(model):
+    """Fuse gate_proj and up_proj into a single weight matrix for faster CPU matmul.
+    Instead of two separate matmuls: gate = x @ W_gate, up = x @ W_up
+    We do one fused matmul: gate_up = x @ [W_gate | W_up] then split.
+    This halves the CPU matmul call overhead for the MLP."""
+    import torch.nn as nn
+    fused_count = 0
+    for layer in model.model.layers:
+        mlp = layer.mlp
+        gate_w = mlp.gate_proj.weight  # [8192, 2048]
+        up_w = mlp.up_proj.weight      # [8192, 2048]
+        # Fuse into [16384, 2048] — one matmul produces both gate and up
+        fused_w = torch.cat([gate_w.data, up_w.data], dim=0)  # [16384, 2048]
+        fused_proj = nn.Linear(gate_w.shape[1], gate_w.shape[0] * 2, bias=False,
+                               dtype=gate_w.dtype, device=gate_w.device)
+        fused_proj.weight = nn.Parameter(fused_w, requires_grad=False)
+        mlp.gate_up_proj = fused_proj
+        # Free the individual projections to save memory
+        del mlp.gate_proj, mlp.up_proj
+        fused_count += 1
+    return fused_count
+
+
 def patched_mlp_forward(self, hidden_states):
     """
     Replaces LlamaMLP.forward:
       Original: down_proj(act_fn(gate_proj(x)) * up_proj(x))
-      Patched:  down_proj(npu_swiglu(gate_proj(x), up_proj(x)))
+      Patched:  down_proj(npu_swiglu(fused_gate_up_proj(x)))
 
-    The NPU fuses SiLU activation + element-wise multiply into one dispatch.
+    Fused gate+up into single matmul, NPU handles SwiGLU activation.
     """
     global npu_dispatch_count
-    # CPU: linear projections (matmul)
-    gate = self.gate_proj(hidden_states)
-    up = self.up_proj(hidden_states)
+    # CPU: fused gate+up projection (single matmul instead of two)
+    intermediate_size = self.down_proj.in_features  # 8192
+    gate_up = self.gate_up_proj(hidden_states)
+    gate = gate_up[..., :intermediate_size]
+    up = gate_up[..., intermediate_size:]
     # NPU: fused SwiGLU activation
     shape = gate.shape
     activated = npu_swiglu(
@@ -216,6 +241,9 @@ def patch_model(model, offload_swiglu=True, offload_rmsnorm=False):
     num_layers = model.config.num_hidden_layers
 
     if offload_swiglu:
+        # Fuse gate+up into single matmul first
+        n_fused = fuse_gate_up_weights(model)
+        print(f"  Fused gate+up projections in {n_fused} layers (2 matmuls -> 1)")
         print(f"  Patching {num_layers} MLP layers -> NPU SwiGLU")
         for layer in model.model.layers:
             layer.mlp.forward = types.MethodType(patched_mlp_forward, layer.mlp)
@@ -244,11 +272,23 @@ def patch_model(model, offload_swiglu=True, offload_rmsnorm=False):
 # =============================================================================
 
 if __name__ == "__main__":
-    MODEL_ID = "HuggingFaceTB/SmolLM2-1.7B-Instruct"
-    PROMPT = "Explain what an NPU is in one sentence:"
-    MAX_NEW_TOKENS = 20
-    OFFLOAD_SWIGLU = True
-    OFFLOAD_RMSNORM = False  # Set True to also offload RMSNorm (adds 49 dispatches/token)
+    import argparse
+    parser = argparse.ArgumentParser(description="LLM inference with AMD Ryzen AI NPU offloading")
+    parser.add_argument("--prompt", "-p", type=str, default="Explain what an NPU is in one sentence:",
+                        help="Input prompt for text generation")
+    parser.add_argument("--max-tokens", "-n", type=int, default=20,
+                        help="Maximum number of new tokens to generate")
+    parser.add_argument("--model", "-m", type=str, default="HuggingFaceTB/SmolLM2-1.7B-Instruct",
+                        help="HuggingFace model ID")
+    parser.add_argument("--no-swiglu", action="store_true", help="Disable NPU SwiGLU offloading")
+    parser.add_argument("--rmsnorm", action="store_true", help="Enable NPU RMSNorm offloading (adds dispatch overhead)")
+    args = parser.parse_args()
+
+    MODEL_ID = args.model
+    PROMPT = args.prompt
+    MAX_NEW_TOKENS = args.max_tokens
+    OFFLOAD_SWIGLU = not args.no_swiglu
+    OFFLOAD_RMSNORM = args.rmsnorm
 
     print("=" * 70)
     print("  Real LLM Inference with AMD Ryzen AI NPU Offloading")
@@ -392,7 +432,17 @@ if __name__ == "__main__":
         print(f"  Decode throughput:    {1/avg_decode:.3f} tokens/s")
     print(f"  NPU dispatches:       {npu_dispatch_count}")
     print(f"  NPU dispatches/token: {npu_dispatch_count // max(n_tokens, 1)}")
-    print()
-    print(f"\n  Note: Per-token time is dominated by data copy to/from NPU")
-    print(f"  and kernel invocation overhead. The XRT hw_context and buffer")
-    print(f"  objects are cached across dispatches for efficiency.")
+
+    # NPU utilization analysis
+    npu_time_per_token = dispatches_per_token * 0.00026  # ~260us per dispatch from C++ profiling
+    npu_util = npu_time_per_token / avg_decode * 100 if avg_decode > 0 else 0
+    print(f"\n  NPU Utilization Analysis:")
+    print(f"    NPU compute/token:  {npu_time_per_token*1000:.1f}ms ({dispatches_per_token} x ~260us)")
+    print(f"    Total time/token:   {avg_decode*1000:.0f}ms")
+    print(f"    NPU utilization:    ~{npu_util:.0f}%")
+    print(f"    CPU matmul time:    ~{(avg_decode - npu_time_per_token)*1000:.0f}ms (gate+up fused + down + attention)")
+    print(f"\n  The NPU finishes in {npu_time_per_token*1000:.1f}ms but waits {(avg_decode-npu_time_per_token)*1000:.0f}ms")
+    print(f"  for CPU matmuls. To increase NPU utilization:")
+    print(f"    - INT8 quantized matmul on NPU (weights shrink 2x, NPU has native INT8)")
+    print(f"    - Batched inference (multiple sequences = larger NPU workloads)")
+    print(f"    - Speculative decoding with a smaller draft model")
