@@ -69,6 +69,9 @@ def main():
     import warnings
     warnings.filterwarnings("ignore")
     os.environ["TQDM_DISABLE"] = "1"  # suppress loading progress bar
+    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+    import logging
+    logging.getLogger("transformers.modeling_utils").setLevel(logging.ERROR)
 
     t0 = time.perf_counter()
     tokenizer = AutoTokenizer.from_pretrained(args.model)
@@ -78,14 +81,16 @@ def main():
     model.eval()
     load_time = time.perf_counter() - t0
     del os.environ["TQDM_DISABLE"]
+    del os.environ["HF_HUB_DISABLE_PROGRESS_BARS"]
     print(f" done ({load_time:.1f}s)")
 
     # ── Quantize & compile ──
     print("  Compiling NPU kernels...", end="", flush=True)
     t0 = time.perf_counter()
-    with suppress_stderr(), open(os.devnull, 'w') as _devnull, \
-         contextlib.redirect_stdout(_devnull):
+    os.environ["TRITON_NPU_QUIET"] = "1"
+    with suppress_stderr():
         mod.patch_model_int8(model, engine, verbose=False)
+    del os.environ["TRITON_NPU_QUIET"]
     compile_time = time.perf_counter() - t0
     print(f" done ({compile_time:.1f}s)")
 
