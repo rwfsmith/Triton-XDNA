@@ -230,8 +230,21 @@ if (-not $SkipBuildMlirAir) {
 
         # Extract the wheel (it's a zip)
         $mlirWhl = Get-ChildItem "$mlirWheelDir\mlir-*.whl" | Select-Object -First 1
-        Write-Host "  Extracting $($mlirWhl.Name)..."
-        Expand-Archive $mlirWhl.FullName -DestinationPath $BuildDir -Force
+        if (-not $mlirWhl) {
+            Write-Error "No MLIR wheel matching 'mlir-*.whl' was found in $mlirWheelDir."
+            Write-Host "Contents of $mlirWheelDir:" -ForegroundColor Yellow
+            $dirContents = Get-ChildItem $mlirWheelDir -ErrorAction SilentlyContinue
+            if ($dirContents) {
+                $dirContents | ForEach-Object { Write-Host "  $($_.Name)" }
+            } else {
+                Write-Host "  (directory is empty)"
+            }
+            Write-Error "Please verify that 'pip download' produced an MLIR wheel and that its name matches the expected pattern."
+            exit 1
+        } else {
+            Write-Host "  Extracting $($mlirWhl.Name)..."
+            Expand-Archive $mlirWhl.FullName -DestinationPath $BuildDir -Force
+        }
 
         if (-not (Test-Path "$mlirDir\lib\cmake\mlir")) {
             Write-Error "MLIR extraction failed — lib\cmake\mlir not found in $mlirDir"
