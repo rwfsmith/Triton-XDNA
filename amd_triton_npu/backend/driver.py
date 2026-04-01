@@ -1301,9 +1301,21 @@ def compile_module(
                         "xrt_coreutil.lib",
                     ]
                     if output_format != "elf":
-                        # Insert test_utils include before /link
+                        # xclbin mode needs test_utils for loading instruction binary:
+                        # add its includes, LIBPATH, and libraries.
+                        # Insert test_utils include before /link so it applies to compilation.
                         link_idx = compile_flags.index("/link")
-                        compile_flags.insert(link_idx, f"/I{os.path.join(aie_test_utils_dir, 'include')}")
+                        compile_flags.insert(
+                            link_idx,
+                            f"/I{os.path.join(aie_test_utils_dir, 'include')}",
+                        )
+                        # Add test_utils library path and dependent Boost libraries for linking.
+                        compile_flags += [
+                            f"/LIBPATH:{os.path.join(aie_test_utils_dir, 'lib')}",
+                            "boost_program_options.lib",
+                            "boost_filesystem.lib",
+                            "test_utils.lib",
+                        ]
                 else:
                     compile_flags = [
                         "g++",
