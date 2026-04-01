@@ -147,10 +147,12 @@ pip install --upgrade pip setuptools wheel
 
 Prepare XRT development files (headers, import library, xclbinutil). Download
 `xrt_windows_sdk.zip` from [Xilinx/XRT releases](https://github.com/Xilinx/XRT/releases)
-and extract to a directory (e.g. `xrt_sdk`):
+and extract the `xrt/` directory to `C:\Program Files\AMD\xrt`:
 
 ```powershell
-$env:XILINX_XRT = "C:\path\to\xrt_sdk\xrt"  # contains include/ and lib/
+# The xrt/ folder inside the zip should end up at:
+#   C:\Program Files\AMD\xrt\include\xrt\xrt_bo.h
+#   C:\Program Files\AMD\xrt\lib\xrt_coreutil.lib
 ```
 
 Run the automated build:
@@ -212,7 +214,6 @@ subst Z: "C:\Program Files\Microsoft Visual Studio\2022\Community\DIA SDK"
 ### Run examples (Windows)
 
 ```powershell
-$env:XILINX_XRT = "C:\path\to\xrt_sdk\xrt"
 cd examples\vec-add
 $env:AIR_TRANSFORM_TILING_SCRIPT = "transform_aie2p.mlir"
 python vec-add.py
@@ -222,10 +223,8 @@ python vec-add.py
 
 | Variable | Purpose |
 |----------|---------|
-| `XILINX_XRT` | XRT SDK directory (contains `include/` and `lib/`) |
 | `AIR_TRANSFORM_TILING_SCRIPT` | Path to MLIR transform dialect IR |
-| `AMD_TRITON_NPU_OUTPUT_FORMAT` | Binary format: `xclbin` (default) or `elf` |
-| `AMD_TRITON_NPU_PROFILE_DISPATCH` | Enable per-dispatch C++ timing (`1`) |
+| `XILINX_XRT` | (Optional) Override XRT SDK location if not in `C:\Program Files\AMD\xrt` |
 
 ### Windows Known Limitations
 

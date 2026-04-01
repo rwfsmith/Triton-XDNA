@@ -69,15 +69,11 @@ Write-Host "Environment setup complete."
 # XRT Development Files
 # =============================================================================
 # Download xrt_windows_sdk.zip from https://github.com/Xilinx/XRT/releases
-# and extract it. Set XILINX_XRT to the xrt/ directory inside the archive.
-#
-#   $env:XILINX_XRT = "C:\path\to\xrt_sdk\xrt"
-if (-not $env:XILINX_XRT) {
-    $xrtDevDefault = Join-Path $ScriptDir "..\xrt-dev"
-    if (Test-Path (Join-Path $xrtDevDefault "include\xrt\xrt_bo.h")) {
-        $env:XILINX_XRT = (Resolve-Path $xrtDevDefault).Path
-        Write-Host "Auto-detected XRT dev dir: $env:XILINX_XRT"
-    } else {
-        Write-Warning "XILINX_XRT not set. Download xrt_windows_sdk.zip from XRT releases and set XILINX_XRT."
-    }
+# and extract the xrt/ directory to C:\Program Files\AMD\xrt.
+# The driver.py auto-detect will find it there without any env var.
+$xrtDefault = Join-Path $env:PROGRAMFILES "AMD\xrt"
+if (Test-Path (Join-Path $xrtDefault "include\xrt\xrt_bo.h")) {
+    Write-Host "XRT SDK found at: $xrtDefault"
+} else {
+    Write-Warning "XRT SDK not found at $xrtDefault. Download xrt_windows_sdk.zip from XRT releases and extract xrt/ there."
 }

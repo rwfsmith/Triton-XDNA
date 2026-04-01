@@ -374,14 +374,15 @@ echo Build complete!
 # ══════════════════════════════════════════════════════════════════════════
 Write-Step 4 "Setting environment variables"
 
-# XRT development files
-if (-not $env:XILINX_XRT) {
-    if ($XrtDir -and (Test-Path "$XrtDir\include\xrt\xrt_bo.h")) {
-        $env:XILINX_XRT = $XrtDir
-        Write-Host "  XILINX_XRT = $env:XILINX_XRT"
-    } else {
-        Write-Warning "XILINX_XRT not set. Download xrt_windows_sdk.zip from https://github.com/Xilinx/XRT/releases"
-    }
+# XRT development files — auto-detected from C:\Program Files\AMD\xrt
+$xrtDefault = Join-Path $env:PROGRAMFILES "AMD\xrt"
+if ($XrtDir -and (Test-Path "$XrtDir\include\xrt\xrt_bo.h")) {
+    Write-Host "  XRT SDK (override): $XrtDir"
+} elseif (Test-Path (Join-Path $xrtDefault "include\xrt\xrt_bo.h")) {
+    Write-Host "  XRT SDK: $xrtDefault"
+} else {
+    Write-Warning "XRT SDK not found. Download xrt_windows_sdk.zip from https://github.com/Xilinx/XRT/releases"
+    Write-Warning "and extract the xrt/ directory to $xrtDefault"
 }
 
 # LLVM binary dir (for llc, etc.)
@@ -420,18 +421,12 @@ Write-Host ("=" * 60) -ForegroundColor Green
 Write-Host " Build complete!" -ForegroundColor Green
 Write-Host ("=" * 60) -ForegroundColor Green
 Write-Host ""
-Write-Host "Environment variables to set in your shell:"
-$effectiveXrtDir = $XrtDir
-if (-not $effectiveXrtDir) {
-    $effectiveXrtDir = $env:XILINX_XRT
-}
-if ($effectiveXrtDir) {
-    Write-Host "  `$env:XILINX_XRT = `"$effectiveXrtDir`""
-}
+
 if ($llvmAieDir) {
+    Write-Host "Environment variables to set in your shell:"
     Write-Host "  `$env:LLVM_BINARY_DIR = `"$llvmAieDir\bin`""
+    Write-Host ""
 }
-Write-Host ""
 Write-Host "To test:"
 Write-Host "  cd $PROJECT_ROOT\examples\vec-add"
 Write-Host "  `$env:AIR_TRANSFORM_TILING_SCRIPT = `"transform_aie2p.mlir`""

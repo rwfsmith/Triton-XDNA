@@ -122,45 +122,201 @@ def _get_xrt_path() -> str:
 
     Search order:
     1. XILINX_XRT environment variable (standard on both Linux and Windows)
-    2. (Windows) Auto-detect: common Program Files paths
+    2. (Windows) C:\\Program Files\\AMD\\xrt  (recommended install location)
     3. (Linux) /opt/xilinx/xrt
 
+    The returned directory must contain the SDK components (include/xrt headers
+    and lib/) needed for JIT compilation.  A runtime-only installation (e.g.
+    DLLs from the NPU driver) is not sufficient.
+
     On Windows, download xrt_windows_sdk.zip from the Xilinx/XRT releases page
-    and set XILINX_XRT to point at the xrt/ directory inside the extracted archive
-    (the directory that contains include/ and lib/ sub-directories).
+    and extract the xrt/ directory to C:\\Program Files\\AMD\\xrt.
     """
-    path = os.getenv("XILINX_XRT", "")
-    if path and os.path.isdir(path):
-        return path
+    def _validate_xrt_sdk(path: str, source: str) -> str:
+        """Ensure *path* contains the SDK components needed for compilation."""
+        has_headers = os.path.isdir(os.path.join(path, "include", "xrt"))
+        has_lib = os.path.isdir(os.path.join(path, "lib"))
+        if has_headers and has_lib:
+            return path
+        if os.path.isdir(path):
+            # Directory exists but is missing SDK pieces – give a targeted hint.
+            missing = []
+            if not has_headers:
+                missing.append("include/xrt (headers)")
+            if not has_lib:
+                missing.append("lib (import libraries)")
+            raise Exception(
+                f"XRT directory found via {source} at {path}, but it appears to "
+                f"be a runtime-only installation — missing: {', '.join(missing)}. "
+                "Download xrt_windows_sdk.zip from https://github.com/Xilinx/XRT/releases "
+                "and extract the full xrt/ directory (with include/ and lib/) to that location."
+            )
+        return ""  # path doesn't exist at all
+
+    env_path = os.getenv("XILINX_XRT", "")
+    if env_path:
+        result = _validate_xrt_sdk(env_path, "XILINX_XRT environment variable")
+        if result:
+            return result
 
     if IS_WINDOWS:
-        # Auto-detect common installation paths
         program_files = os.environ.get("PROGRAMFILES", "C:\\Program Files")
-        default_paths = [
-            os.path.join(program_files, "AMD", "XDNA", "xrt"),
-            os.path.join(program_files, "Xilinx", "XRT"),
-        ]
-
-        for p in default_paths:
-            # Prefer directories that contain the development files
-            # (include/xrt/ and lib/) needed for JIT compilation
-            if os.path.isdir(os.path.join(p, "include", "xrt")):
-                return p
-
-        # Fallback: accept any existing path (runtime-only SDK)
-        for p in default_paths:
-            if os.path.isdir(p):
-                return p
+        default_path = os.path.join(program_files, "AMD", "xrt")
+        result = _validate_xrt_sdk(default_path, "default location")
+        if result:
+            return result
     else:
-        # Linux default
-        if os.path.isdir("/opt/xilinx/xrt"):
-            return "/opt/xilinx/xrt"
+        result = _validate_xrt_sdk("/opt/xilinx/xrt", "default location")
+        if result:
+            return result
 
     raise Exception(
-        "XILINX_XRT is not set and XRT could not be auto-detected. "
+        "XRT development files not found. "
         "Download xrt_windows_sdk.zip from https://github.com/Xilinx/XRT/releases "
-        "and set XILINX_XRT to the xrt/ directory inside the extracted archive."
+        "and extract the xrt/ directory to C:\\Program Files\\AMD\\xrt "
+        "(or set the XILINX_XRT environment variable to its location)."
     )
+
+
+def _find_msvc_cl() -> str:
+    """Locate cl.exe for JIT compilation on Windows.
+
+    Search order:
+    1. cl.exe already on PATH (e.g. running from a VS Developer Command Prompt)
+    2. vswhere.exe to discover Visual Studio installations, then use the
+       latest MSVC toolset's Hostx64/x64/cl.exe
+
+    Returns the absolute path to cl.exe.
+    Raises Exception with setup instructions if MSVC cannot be found.
+    """
+    # 1. Already on PATH?
+    cl_on_path = shutil.which("cl.exe") or shutil.which("cl")
+    if cl_on_path:
+        return cl_on_path
+
+    # 2. Discover via vswhere
+    program_files_x86 = os.environ.get(
+        "ProgramFiles(x86)", "C:\\Program Files (x86)"
+    )
+    vswhere = os.path.join(
+        program_files_x86,
+        "Microsoft Visual Studio",
+        "Installer",
+        "vswhere.exe",
+    )
+    if os.path.isfile(vswhere):
+        try:
+            vs_path = (
+                subprocess.check_output(
+                    [
+                        vswhere,
+                        "-latest",
+                        "-products", "*",
+                        "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                        "-property", "installationPath",
+                    ],
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                )
+                .strip()
+                .splitlines()[0]
+            )
+        except (subprocess.CalledProcessError, IndexError):
+            vs_path = ""
+
+        if vs_path:
+            # Find the latest MSVC toolset version
+            msvc_root = os.path.join(vs_path, "VC", "Tools", "MSVC")
+            if os.path.isdir(msvc_root):
+                versions = sorted(os.listdir(msvc_root), reverse=True)
+                for ver in versions:
+                    candidate = os.path.join(
+                        msvc_root, ver, "bin", "Hostx64", "x64", "cl.exe"
+                    )
+                    if os.path.isfile(candidate):
+                        return candidate
+
+    raise Exception(
+        "MSVC compiler (cl.exe) not found. Triton-XDNA needs MSVC for JIT "
+        "compilation of NPU dispatch code on Windows.\n"
+        "Options:\n"
+        "  1. Run from a 'x64 Native Tools Command Prompt for VS 2022'\n"
+        "  2. Install Visual Studio 2022 with the 'Desktop development with C++' workload\n"
+        "     (https://visualstudio.microsoft.com/)\n"
+        "  3. Install the Build Tools for Visual Studio 2022\n"
+        "     (https://visualstudio.microsoft.com/visual-cpp-build-tools/)"
+    )
+
+
+def _get_msvc_env(cl_path: str) -> dict:
+    """Build the environment variables needed for cl.exe to find headers and libs.
+
+    If INCLUDE and LIB are already set (e.g. from vcvars), returns the current
+    environment unchanged.  Otherwise, derives them from the cl.exe location
+    and the Windows SDK.
+    """
+    env = os.environ.copy()
+
+    # If INCLUDE is already set, assume the environment is already configured
+    if env.get("INCLUDE"):
+        return env
+
+    # Derive MSVC paths from cl.exe location:
+    #   .../VC/Tools/MSVC/<ver>/bin/Hostx64/x64/cl.exe
+    cl_dir = os.path.dirname(cl_path)  # .../bin/Hostx64/x64
+    msvc_ver_dir = os.path.normpath(
+        os.path.join(cl_dir, "..", "..", "..")
+    )  # .../VC/Tools/MSVC/<ver>
+
+    msvc_include = os.path.join(msvc_ver_dir, "include")
+    msvc_lib = os.path.join(msvc_ver_dir, "lib", "x64")
+
+    if not os.path.isdir(msvc_include):
+        raise Exception(
+            f"Found cl.exe at {cl_path} but could not locate MSVC include "
+            f"directory at {msvc_include}. Run from a VS Developer Command Prompt "
+            "or ensure INCLUDE/LIB environment variables are set."
+        )
+
+    # Find Windows SDK
+    sdk_root = os.environ.get(
+        "WindowsSdkDir",
+        os.path.join(
+            os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"),
+            "Windows Kits",
+            "10",
+        ),
+    )
+    sdk_version = os.environ.get("WindowsSDKVersion", "").rstrip("\\")
+    if not sdk_version:
+        # Auto-detect latest SDK version
+        sdk_inc_root = os.path.join(sdk_root, "Include")
+        if os.path.isdir(sdk_inc_root):
+            versions = sorted(
+                [d for d in os.listdir(sdk_inc_root) if d.startswith("10.")],
+                reverse=True,
+            )
+            sdk_version = versions[0] if versions else ""
+
+    include_paths = [msvc_include]
+    lib_paths = [msvc_lib]
+
+    if sdk_version:
+        sdk_inc = os.path.join(sdk_root, "Include", sdk_version)
+        sdk_lib = os.path.join(sdk_root, "Lib", sdk_version)
+        for subdir in ["ucrt", "shared", "um"]:
+            p = os.path.join(sdk_inc, subdir)
+            if os.path.isdir(p):
+                include_paths.append(p)
+        for subdir in ["ucrt", "um"]:
+            p = os.path.join(sdk_lib, subdir, "x64")
+            if os.path.isdir(p):
+                lib_paths.append(p)
+
+    env["INCLUDE"] = ";".join(include_paths)
+    env["LIB"] = ";".join(lib_paths)
+    env["PATH"] = os.path.dirname(cl_path) + ";" + env.get("PATH", "")
+    return env
 
 
 def _get_aie_test_utils_path() -> str:
@@ -942,6 +1098,7 @@ def _generate_elf_launcher(constants, signature, kernel_name):
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <stdexcept>
 
 #include "xrt/xrt_bo.h"
 #include "xrt/xrt_device.h"
@@ -971,17 +1128,23 @@ static PyObject* py_set_paths(PyObject* self, PyObject* args) {{
 // ELF-based XRT launch:
 static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" for i, ty in ptr_args)}, {arg_decls}) {{
   if (gridX*gridY*gridZ > 0) {{
+    try {{
 
     int verbosity = 1;
 
     // Get a device handle
     unsigned int device_index = 0;
+    if (verbosity >= 1)
+        std::cout << "Opening device " << device_index << "..." << std::endl;
     auto device = xrt::device(device_index);
 
     // Load the ELF
     if (verbosity >= 1)
         std::cout << "Loading ELF: " << elf_path << std::endl;
     xrt::elf ctx_elf{{elf_path}};
+
+    if (verbosity >= 1)
+        std::cout << "Creating hw_context..." << std::endl;
     xrt::hw_context context = xrt::hw_context(device, ctx_elf);
 
     // Kernel name from ELF config (e.g., "main:vecadd")
@@ -1018,6 +1181,11 @@ static void _launch(int gridX, int gridY, int gridZ, {', '.join(f"long size{i}" 
 
     if (verbosity >= 1)
         std::cout << "Launch finished." << std::endl;
+
+    }} catch (const std::exception& e) {{
+        std::string msg = std::string("XRT runtime error: ") + e.what();
+        PyErr_SetString(PyExc_RuntimeError, msg.c_str());
+    }}
   }}
 }}
 
@@ -1282,9 +1450,10 @@ def compile_module(
                 Path(launcher_src_path).write_text(src)
                 # Compile the launcher shared library.
                 if IS_WINDOWS:
-                    # Use MSVC (cl.exe) on Windows
+                    cl_path = _find_msvc_cl()
+                    msvc_env = _get_msvc_env(cl_path)
                     compile_flags = [
-                        "cl.exe",
+                        cl_path,
                         "/std:c++latest",
                         "/Zc:__cplusplus",
                         "/EHsc",
@@ -1317,6 +1486,7 @@ def compile_module(
                             "test_utils.lib",
                         ]
                 else:
+                    msvc_env = None
                     compile_flags = [
                         "g++",
                         "-std=c++23",
@@ -1347,7 +1517,12 @@ def compile_module(
                     compile_flags += ["-o", so_path]
                 _quiet = os.getenv("TRITON_NPU_QUIET", "0") != "0"
                 _devnull = subprocess.DEVNULL if _quiet else None
-                subprocess.check_call(compile_flags, stdout=_devnull, stderr=_devnull)
+                subprocess.check_call(
+                    compile_flags,
+                    stdout=_devnull,
+                    stderr=_devnull,
+                    env=msvc_env if msvc_env else None,
+                )
 
                 ###### Compile to binary (ELF or xclbin + insts)
                 air_mlir_path = os.path.join(air_proj_path, "asm_air_output.mlir")
@@ -1489,9 +1664,21 @@ def compile_module(
             # Read the cached kernel name
             with open(cache_elf_kernel_path) as f:
                 elf_kernel_name = f.read().strip()
-            mod.set_paths(cache_elf_path, elf_kernel_name)
+            # Strip Windows extended-length path prefix (\\?\) which
+            # confuses XRT's internal path parsing (stoul error).
+            elf_path_str = cache_elf_path
+            if IS_WINDOWS and elf_path_str.startswith("\\\\?\\"):
+                elf_path_str = elf_path_str[4:]
+            mod.set_paths(elf_path_str, elf_kernel_name)
         else:
-            mod.set_paths(cache_xclbin_path, cache_insts_path)
+            xclbin_path_str = cache_xclbin_path
+            insts_path_str = cache_insts_path
+            if IS_WINDOWS:
+                if xclbin_path_str.startswith("\\\\?\\"):
+                    xclbin_path_str = xclbin_path_str[4:]
+                if insts_path_str.startswith("\\\\?\\"):
+                    insts_path_str = insts_path_str[4:]
+            mod.set_paths(xclbin_path_str, insts_path_str)
         return mod.launch(
             gridX,
             gridY,
