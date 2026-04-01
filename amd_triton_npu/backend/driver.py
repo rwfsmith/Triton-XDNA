@@ -23,6 +23,8 @@ from air.compiler.util import run_transform
 from air.ir import *
 import air.passmanager
 
+IS_WINDOWS = sys.platform == "win32"
+
 autotune_time = False
 
 
@@ -95,7 +97,19 @@ def _get_air_opt_path() -> str:
     aircc_path = Path(aircc.__file__).resolve()
     # Navigate from .../mlir_air/python/air/compiler/aircc/main.py to .../mlir_air/
     mlir_air_root = aircc_path.parent.parent.parent.parent.parent
-    air_opt_path = mlir_air_root / "bin" / "air-opt"
+    binary_name = "air-opt.exe" if IS_WINDOWS else "air-opt"
+    air_opt_path = mlir_air_root / "bin" / binary_name
+
+    if not air_opt_path.exists():
+        # Fallback: check MLIR_AIR_INSTALL_DIR env var
+        mlir_air_env = os.environ.get("MLIR_AIR_INSTALL_DIR")
+        if mlir_air_env:
+            air_opt_path = Path(mlir_air_env) / "bin" / binary_name
+        if not air_opt_path.exists():
+            # Fallback: try relative path from aircc module
+            candidate = Path(os.path.dirname(aircc_path)).parent.parent.parent / "bin" / binary_name
+            if candidate.exists():
+                air_opt_path = candidate
 
     if not air_opt_path.exists():
         raise RuntimeError(f"Could not find air-opt binary at {air_opt_path}")
@@ -104,13 +118,55 @@ def _get_air_opt_path() -> str:
 
 
 def _get_xrt_path() -> str:
+    """Get the path to the XRT development directory (headers + import lib).
+
+    Search order:
+    1. XILINX_XRT environment variable (standard on both Linux and Windows)
+    2. (Windows) Auto-detect: common Program Files paths
+    3. (Linux) /opt/xilinx/xrt
+
+    On Windows, download xrt_windows_sdk.zip from the Xilinx/XRT releases page
+    and set XILINX_XRT to point at the xrt/ directory inside the extracted archive
+    (the directory that contains include/ and lib/ sub-directories).
+    """
     path = os.getenv("XILINX_XRT", "")
-    if path == "":
-        raise Exception("XILINX_XRT is not set. Is xrt installed in system?")
-    return path
+    if path and os.path.isdir(path):
+        return path
+
+    if IS_WINDOWS:
+        # Auto-detect common installation paths
+        program_files = os.environ.get("PROGRAMFILES", "C:\\Program Files")
+        default_paths = [
+            os.path.join(program_files, "AMD", "XDNA", "xrt"),
+            os.path.join(program_files, "Xilinx", "XRT"),
+        ]
+
+        for p in default_paths:
+            # Prefer directories that contain the development files
+            # (include/xrt/ and lib/) needed for JIT compilation
+            if os.path.isdir(os.path.join(p, "include", "xrt")):
+                return p
+
+        # Fallback: accept any existing path (runtime-only SDK)
+        for p in default_paths:
+            if os.path.isdir(p):
+                return p
+    else:
+        # Linux default
+        if os.path.isdir("/opt/xilinx/xrt"):
+            return "/opt/xilinx/xrt"
+
+    raise Exception(
+        "XILINX_XRT is not set and XRT could not be auto-detected. "
+        "Download xrt_windows_sdk.zip from https://github.com/Xilinx/XRT/releases "
+        "and set XILINX_XRT to the xrt/ directory inside the extracted archive."
+    )
 
 
 def _get_aie_test_utils_path() -> str:
+    custom = os.getenv("AIE_TEST_UTILS_DIR")
+    if custom:
+        return custom
     path = (
         Path(aiecc.__file__).parent.parent.parent.parent.parent
         / "runtime_lib"
@@ -422,7 +478,8 @@ def _get_transform_ir_string():
                 f"Use an absolute path or run from the directory containing the script."
             )
         with open(custom_script_path, "r") as f:
-            print(f"Using custom tiling script from: {custom_script_path}")
+            if os.getenv("TRITON_NPU_QUIET", "0") == "0":
+                print(f"Using custom tiling script from: {custom_script_path}")
             user_script = f.read()
         return _inject_transform_library(user_script)
 
@@ -883,6 +940,7 @@ def _generate_elf_launcher(constants, signature, kernel_name):
 
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 
 #include "xrt/xrt_bo.h"
@@ -1205,7 +1263,7 @@ def compile_module(
 
         cache = get_cache_manager(key)
         name = "__npu_dispatch"
-        filename = f"{name}.so"
+        filename = f"{name}.pyd" if IS_WINDOWS else f"{name}.so"
         cache_path = cache.get_file(filename)
         if output_format == "elf":
             cache_elf_path = cache.get_file("aie.elf")
@@ -1217,46 +1275,100 @@ def compile_module(
         if cache_path is None:
             with tempfile.TemporaryDirectory() as tmpdir:
                 launcher_src_path = os.path.join(tmpdir, "main.cxx")
-                so_path = os.path.join(tmpdir, "xrt_dispatch.exe")
+                if IS_WINDOWS:
+                    so_path = os.path.join(tmpdir, "xrt_dispatch.pyd")
+                else:
+                    so_path = os.path.join(tmpdir, "xrt_dispatch.exe")
                 Path(launcher_src_path).write_text(src)
                 # Compile the launcher shared library.
-                compile_flags = [
-                    "g++",
-                    "-std=c++23",
-                    launcher_src_path,
-                    f"-I{py_include_dir}",
-                    f"-I{include_dir}",
-                    f"-L{py_lib_dir}",
-                    "-shared",
-                    f"-l{py_lib}",
-                    "-fPIC",
-                    "-Wall",
-                    f"-I{os.path.join(xrt_dir, 'include')}",
-                    f"-L{os.path.join(xrt_dir, 'lib')}",
-                    "-luuid",
-                    "-lxrt_coreutil",
-                    "-lrt",
-                    "-lstdc++",
-                ]
-                if output_format != "elf":
-                    # xclbin mode needs test_utils for loading instruction binary
-                    compile_flags += [
-                        f"-I{os.path.join(aie_test_utils_dir, 'include')}",
-                        f"-L{os.path.join(aie_test_utils_dir, 'lib')}",
-                        "-lboost_program_options",
-                        "-lboost_filesystem",
-                        "-ltest_utils",
+                if IS_WINDOWS:
+                    # Use MSVC (cl.exe) on Windows
+                    compile_flags = [
+                        "cl.exe",
+                        "/std:c++latest",
+                        "/Zc:__cplusplus",
+                        "/EHsc",
+                        "/LD",
+                        f"/Fe:{so_path}",
+                        launcher_src_path,
+                        f"/I{py_include_dir}",
+                        f"/I{include_dir}",
+                        f"/I{os.path.join(xrt_dir, 'include')}",
+                        f"/link",
+                        f"/LIBPATH:{py_lib_dir}",
+                        f"/LIBPATH:{os.path.join(xrt_dir, 'lib')}",
+                        f"{py_lib}",
+                        "xrt_coreutil.lib",
                     ]
-                compile_flags += ["-o", so_path]
-                subprocess.check_call(compile_flags)
+                    if output_format != "elf":
+                        # Insert test_utils include before /link
+                        link_idx = compile_flags.index("/link")
+                        compile_flags.insert(link_idx, f"/I{os.path.join(aie_test_utils_dir, 'include')}")
+                else:
+                    compile_flags = [
+                        "g++",
+                        "-std=c++23",
+                        launcher_src_path,
+                        f"-I{py_include_dir}",
+                        f"-I{include_dir}",
+                        f"-L{py_lib_dir}",
+                        "-shared",
+                        f"-l{py_lib}",
+                        "-fPIC",
+                        "-Wall",
+                        f"-I{os.path.join(xrt_dir, 'include')}",
+                        f"-L{os.path.join(xrt_dir, 'lib')}",
+                        "-luuid",
+                        "-lxrt_coreutil",
+                        "-lrt",
+                        "-lstdc++",
+                    ]
+                    if output_format != "elf":
+                        # xclbin mode needs test_utils for loading instruction binary
+                        compile_flags += [
+                            f"-I{os.path.join(aie_test_utils_dir, 'include')}",
+                            f"-L{os.path.join(aie_test_utils_dir, 'lib')}",
+                            "-lboost_program_options",
+                            "-lboost_filesystem",
+                            "-ltest_utils",
+                        ]
+                    compile_flags += ["-o", so_path]
+                _quiet = os.getenv("TRITON_NPU_QUIET", "0") != "0"
+                _devnull = subprocess.DEVNULL if _quiet else None
+                subprocess.check_call(compile_flags, stdout=_devnull, stderr=_devnull)
 
                 ###### Compile to binary (ELF or xclbin + insts)
                 air_mlir_path = os.path.join(air_proj_path, "asm_air_output.mlir")
+                aircc_binary_name = "aircc.exe" if IS_WINDOWS else "aircc"
                 aircc_bin = str(
                     Path(aircc.__file__).resolve().parent.parent.parent.parent.parent
                     / "bin"
-                    / "aircc"
+                    / aircc_binary_name
                 )
+                # Fallback: check MLIR_AIR_INSTALL_DIR if air module was copied
+                if not os.path.isfile(aircc_bin):
+                    mlir_air_env = os.environ.get("MLIR_AIR_INSTALL_DIR", "")
+                    if mlir_air_env:
+                        candidate = os.path.join(mlir_air_env, "bin", aircc_binary_name)
+                        if os.path.isfile(candidate):
+                            aircc_bin = candidate
+
+                # On Windows, construct peano path from llvm-aie package and
+                # add mlir_aie/bin to PATH so aircc can find aiecc.exe
+                peano_flag = "--peano="
+                if IS_WINDOWS:
+                    peano_dir = os.environ.get("LLVM_BINARY_DIR", "")
+                    if peano_dir:
+                        # LLVM_BINARY_DIR points to bin/, peano wants parent
+                        peano_flag = f"--peano={str(Path(peano_dir).parent)}"
+                    # Ensure aiecc is findable
+                    try:
+                        import mlir_aie
+                        mlir_aie_bin = str(Path(mlir_aie.__path__[0]) / "bin")
+                    except ImportError:
+                        mlir_aie_bin = str(Path(aircc.__file__).resolve().parent.parent.parent / "mlir_aie" / "bin")
+                    if os.path.isdir(mlir_aie_bin) and mlir_aie_bin not in os.environ.get("PATH", ""):
+                        os.environ["PATH"] = mlir_aie_bin + os.pathsep + os.environ.get("PATH", "")
 
                 if output_format == "elf":
                     elf_path = os.path.join(air_proj_path, "aie.elf")
@@ -1270,7 +1382,7 @@ def compile_module(
                         "elf",
                         "--elf-name",
                         elf_path,
-                        "--peano=",
+                        peano_flag,
                         air_mlir_path,
                     ]
                 else:
@@ -1282,11 +1394,13 @@ def compile_module(
                         npu_version,
                         "--no-xchesscc",
                         "--no-xbridge",
+                        "--output-format",
+                        "xclbin",
                         "-i",
                         insts_path,
                         "-o",
                         xclbin_path,
-                        "--peano=",
+                        peano_flag,
                         air_mlir_path,
                     ]
                 # Enable bf16 emulation: hardware truncates f32 -> bf16 before
@@ -1297,7 +1411,17 @@ def compile_module(
                 # default changed from [4,4] to [] in mlir-air #1470).
                 aircc_cmd.insert(-1, "--air-runtime-loop-tiling-sizes=4")
                 aircc_cmd.insert(-1, "--air-runtime-loop-tiling-sizes=4")
-                subprocess.check_call(aircc_cmd)
+                subprocess.check_call(aircc_cmd, stdout=_devnull, stderr=_devnull)
+
+                # Verify xclbin was generated (requires xclbinutil on PATH).
+                # On Windows, get xclbinutil from the XRT Windows SDK:
+                # https://github.com/Xilinx/XRT/releases (xrt_windows_sdk.zip)
+                if output_format != "elf" and not os.path.exists(xclbin_path):
+                    raise RuntimeError(
+                        f"xclbin not generated at {xclbin_path}. "
+                        f"Ensure xclbinutil is on PATH. On Windows, download "
+                        f"xrt_windows_sdk.zip from https://github.com/Xilinx/XRT/releases"
+                    )
 
                 # Cache format-specific artifacts first, then the .so last.
                 # This avoids partial cache entries if aircc or kernel name
@@ -1333,12 +1457,6 @@ def compile_module(
                         print(f"  insts: {cache_insts_path}")
                     return None
         else:
-            print(
-                "got cache path: "
-                + cache_path
-                + " compilation is therefore skipped (delete cache path to force recompile)."
-            )
-
             # Check for compile-only mode (cache hit)
             if os.getenv("AMD_TRITON_NPU_COMPILE_ONLY", "0") == "1":
                 print(f"Compile-only mode (cache hit): binaries at {cache_path}")
