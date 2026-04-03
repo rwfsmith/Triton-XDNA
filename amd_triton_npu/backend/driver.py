@@ -9,6 +9,7 @@ import sysconfig
 
 import os, subprocess, tempfile, platform
 import importlib.util
+import importlib.metadata
 import shutil
 
 from pathlib import Path
@@ -79,42 +80,64 @@ def _format_of(ty):
     }[ty]
 
 
-def _get_air_opt_path() -> str:
-    """
-    Get the path to air-opt binary from pip-installed mlir-air package.
+def _find_mlir_air_binary(binary_name: str) -> str:
+    """Locate a binary inside the mlir-air install prefix.
 
-    Uses the aircc module's location to find the mlir_air package root,
-    then locates the air-opt binary in the bin/ directory.
+    Search order:
+    1. MLIR_AIR_INSTALL_DIR environment variable
+    2. mlir-air .pth file (when built from source on Windows)
+    3. pip-wheel layout: navigate up from aircc module location
+    4. shutil.which() (PATH lookup)
 
     Returns:
-        str: Path to air-opt binary
+        str: Absolute path to the binary
 
     Raises:
-        RuntimeError: If air-opt binary not found
+        RuntimeError: If not found
     """
-    # aircc.__file__ gives: /path/to/mlir_air/python/air/compiler/aircc/main.py
-    # We need: /path/to/mlir_air/bin/air-opt
+    candidates = []
+
+    # 1. Explicit env var
+    mlir_air_env = os.environ.get("MLIR_AIR_INSTALL_DIR")
+    if mlir_air_env:
+        candidates.append(Path(mlir_air_env) / "bin" / binary_name)
+
+    # 2. .pth file: points to <install>/python, so <install>/bin has binaries
+    import site
+    for sp in site.getsitepackages():
+        pth = os.path.join(sp, "mlir-air.pth")
+        if os.path.exists(pth):
+            with open(pth) as f:
+                pth_dir = f.read().strip()
+            if pth_dir:
+                candidates.append(Path(pth_dir).resolve().parent / "bin" / binary_name)
+
+    # 3. pip-wheel layout: aircc.__file__ -> .../mlir_air/python/air/compiler/aircc/main.py
     aircc_path = Path(aircc.__file__).resolve()
-    # Navigate from .../mlir_air/python/air/compiler/aircc/main.py to .../mlir_air/
-    mlir_air_root = aircc_path.parent.parent.parent.parent.parent
+    candidates.append(aircc_path.parent.parent.parent.parent.parent / "bin" / binary_name)
+    # Also try 3 levels up (namespace package: air/compiler/aircc/main.py -> site-packages)
+    candidates.append(aircc_path.parent.parent.parent / "bin" / binary_name)
+
+    for c in candidates:
+        if c.exists():
+            return str(c)
+
+    # 4. Fall back to PATH
+    found = shutil.which(binary_name)
+    if found:
+        return found
+
+    tried = "\n  ".join(str(c) for c in candidates)
+    raise RuntimeError(
+        f"Could not find {binary_name}. Searched:\n  {tried}\n"
+        f"Set MLIR_AIR_INSTALL_DIR to the mlir-air install prefix."
+    )
+
+
+def _get_air_opt_path() -> str:
+    """Get the path to the air-opt binary."""
     binary_name = "air-opt.exe" if IS_WINDOWS else "air-opt"
-    air_opt_path = mlir_air_root / "bin" / binary_name
-
-    if not air_opt_path.exists():
-        # Fallback: check MLIR_AIR_INSTALL_DIR env var
-        mlir_air_env = os.environ.get("MLIR_AIR_INSTALL_DIR")
-        if mlir_air_env:
-            air_opt_path = Path(mlir_air_env) / "bin" / binary_name
-        if not air_opt_path.exists():
-            # Fallback: try relative path from aircc module
-            candidate = Path(os.path.dirname(aircc_path)).parent.parent.parent / "bin" / binary_name
-            if candidate.exists():
-                air_opt_path = candidate
-
-    if not air_opt_path.exists():
-        raise RuntimeError(f"Could not find air-opt binary at {air_opt_path}")
-
-    return str(air_opt_path)
+    return _find_mlir_air_binary(binary_name)
 
 
 def _get_xrt_path() -> str:
@@ -1527,18 +1550,7 @@ def compile_module(
                 ###### Compile to binary (ELF or xclbin + insts)
                 air_mlir_path = os.path.join(air_proj_path, "asm_air_output.mlir")
                 aircc_binary_name = "aircc.exe" if IS_WINDOWS else "aircc"
-                aircc_bin = str(
-                    Path(aircc.__file__).resolve().parent.parent.parent.parent.parent
-                    / "bin"
-                    / aircc_binary_name
-                )
-                # Fallback: check MLIR_AIR_INSTALL_DIR if air module was copied
-                if not os.path.isfile(aircc_bin):
-                    mlir_air_env = os.environ.get("MLIR_AIR_INSTALL_DIR", "")
-                    if mlir_air_env:
-                        candidate = os.path.join(mlir_air_env, "bin", aircc_binary_name)
-                        if os.path.isfile(candidate):
-                            aircc_bin = candidate
+                aircc_bin = _find_mlir_air_binary(aircc_binary_name)
 
                 # On Windows, construct peano path from llvm-aie package and
                 # add mlir_aie/bin to PATH so aircc can find aiecc.exe
@@ -1548,6 +1560,20 @@ def compile_module(
                     if peano_dir:
                         # LLVM_BINARY_DIR points to bin/, peano wants parent
                         peano_flag = f"--peano={str(Path(peano_dir).parent)}"
+                    else:
+                        # Auto-detect from pip-installed llvm-aie package
+                        try:
+                            dist = importlib.metadata.distribution("llvm-aie")
+                            llvm_aie_root = Path(dist._path.parent) / "llvm-aie"
+                            if (llvm_aie_root / "bin" / "opt.exe").exists():
+                                peano_flag = f"--peano={llvm_aie_root}"
+                        except Exception:
+                            pass
+                    # Also check PEANO_INSTALL_DIR env var
+                    if peano_flag == "--peano=":
+                        peano_env = os.environ.get("PEANO_INSTALL_DIR", "")
+                        if peano_env and os.path.isdir(peano_env):
+                            peano_flag = f"--peano={peano_env}"
                     # Ensure aiecc is findable
                     try:
                         import mlir_aie
